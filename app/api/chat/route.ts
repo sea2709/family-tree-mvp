@@ -41,6 +41,10 @@ Rules:
 
 type OllamaProposal = Proposal & { [key: string]: unknown };
 
+// Messages, prompts and proposals contain family names and stories, so
+// they stay out of the hosting provider's logs in production.
+const LOG_CONTENT = process.env.NODE_ENV !== "production";
+
 function log(...args: unknown[]) {
   console.log(`[chat ${new Date().toISOString().slice(11, 23)}]`, ...args);
 }
@@ -59,6 +63,7 @@ function preview(text: string, max = 120): string {
 
 function logProposals(modelUsed: string, proposals: Proposal[]) {
   log(`result via ${modelUsed}: ${proposals.length} proposal(s)`);
+  if (!LOG_CONTENT) return;
   const nameOf = (ref?: string) =>
     proposals.find((p) => p.kind === "person" && p.tempId === ref)?.displayName ?? ref;
   for (const p of proposals) {
@@ -274,6 +279,8 @@ async function tryOllama(
 ): Promise<{ reply: string; proposals: Proposal[]; modelUsed: string } | null> {
   const host = process.env.OLLAMA_HOST || "http://localhost:11434";
   const model = process.env.OLLAMA_MODEL || "gemma4:12b";
+  // Required by Ollama Cloud (https://ollama.com); local Ollama needs none.
+  const apiKey = process.env.OLLAMA_API_KEY;
   // Large local models (e.g. gemma4:31b) can need well over 90s for a
   // multi-fact message, so the limit is configurable.
   const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS) || 90_000;
@@ -283,10 +290,16 @@ async function tryOllama(
   try {
     const userPrompt = buildUserPrompt(message, roster, rels, egoId, history);
 
-    log(`ollama → ${host} model=${model}, prompt ${userPrompt.length} chars:\n${indent(userPrompt)}`);
+    log(
+      `ollama → ${host} model=${model}, prompt ${userPrompt.length} chars` +
+        (LOG_CONTENT ? `:\n${indent(userPrompt)}` : "")
+    );
     const res = await fetch(`${host.replace(/\/$/, "")}/api/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
       body: JSON.stringify({
         model,
         messages: [
@@ -304,11 +317,17 @@ async function tryOllama(
     });
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
-      log(`ollama ✗ HTTP ${res.status} after ${Date.now() - started}ms: ${preview(errText)}`);
+      const authHint =
+        res.status === 401 || res.status === 403
+          ? apiKey
+            ? " (check OLLAMA_API_KEY)"
+            : " (OLLAMA_API_KEY is not set)"
+          : "";
+      log(`ollama ✗ HTTP ${res.status} after ${Date.now() - started}ms${authHint}: ${preview(errText)}`);
       return null;
     }
     const data = await res.json();
-    console.log(`ollama response: ${JSON.stringify(data)}`);
+    if (LOG_CONTENT) console.log(`ollama response: ${JSON.stringify(data)}`);
     log(
       `ollama ✓ responded in ${Date.now() - started}ms`,
       `(load ${nsToMs(data?.load_duration)},`,
@@ -326,7 +345,7 @@ async function tryOllama(
     try {
       parsed = JSON.parse(content);
     } catch {
-      log(`ollama ✗ invalid JSON: ${preview(content, 300)}`);
+      log(`ollama ✗ invalid JSON${LOG_CONTENT ? `: ${preview(content, 300)}` : ""}`);
       return null;
     }
     const rawCount = Array.isArray(parsed.proposals) ? parsed.proposals.length : 0;
@@ -371,7 +390,8 @@ export async function POST(req: Request) {
     // localhost). Any failure — not running, bad JSON, timeout —
     // falls through to the deterministic fallback. Never crash.
     log(
-      `request (roster ${roster.length}, relationships ${relationships.length}, history ${history.length}, ego ${egoId ?? "none"}):\n${indent(message)}`
+      `request (roster ${roster.length}, relationships ${relationships.length}, history ${history.length}, ego ${egoId ?? "none"})` +
+        (LOG_CONTENT ? `:\n${indent(message)}` : "")
     );
     const ollama = await tryOllama(message, roster, relationships, egoId, history);
     if (ollama) {

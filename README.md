@@ -40,6 +40,27 @@ and photos never leave it when `OLLAMA_HOST` is localhost. That is the
 stays with the family, the model can be swapped, and the app does not
 die if a closed service disappears.
 
+### Deploying with Ollama Cloud
+
+A hosted deployment can't reach your local Ollama, so point it at
+[Ollama Cloud](https://docs.ollama.com/cloud) instead. It serves the
+same open models through the same API. Set these on the host (never
+in client code):
+
+```
+OLLAMA_HOST=https://ollama.com
+OLLAMA_MODEL=gemma4:31b      # any name from https://ollama.com/api/tags
+OLLAMA_API_KEY=...           # created in your ollama.com account
+OLLAMA_TIMEOUT_MS=30000      # optional; keep it under the host's request limit
+```
+
+Cloud requests are billed per token (one chat message is roughly
+2–3K tokens). Family data does leave the machine in this mode; Ollama
+says it does not log or train on cloud prompts. In production the
+`/api/chat` route only logs timings and counts, not message text or
+names. If the key is missing or wrong, the server log says so and the
+chat uses the fallback parser.
+
 ### Without Ollama
 
 The app still works. If Ollama is not running, returns bad JSON, or
@@ -105,6 +126,6 @@ generation, automatic duplicate merging, timeline view.
 - **Extraction:** keep the proposal shape, but add more tool calls
   (update person, add story, ask clarification) and a proper agent
   framework such as Mastra or LangGraph for multi-turn memory.
-- **Deploy:** host the frontend on Render or DigitalOcean and run
-  the model there, or keep the model local and deploy only a demo
-  with the fallback parser.
+- **Deploy:** host the app on Vercel, Render or DigitalOcean and use
+  Ollama Cloud for the model (see "Deploying with Ollama Cloud"), or
+  deploy only a demo with the fallback parser.

@@ -51,10 +51,9 @@ export type ChatMessage = {
   text: string;
 };
 
-export type RosterPerson = {
-  id: string;
-  displayName: string;
-  preferredName?: string | null;
-  birthYear?: number | null;
-  birthPlace?: string | null;
-};
+export type RosterPerson = Pick<
+  Person,
+  "id" | "displayName" | "preferredName" | "birthYear" | "birthPlace"
+>;
+
+export type RosterRelationship = Pick<Relationship, "fromPersonId" | "toPersonId" | "type">;

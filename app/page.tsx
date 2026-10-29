@@ -36,14 +36,16 @@ function describeProposal(
   proposals: Proposal[]
 ): string {
   if (p.kind === "person") {
-    const name = p.displayName ?? "Unnamed person";
-    const bits = [
-      p.preferredName && p.preferredName !== name
-        ? `${name} (${p.preferredName})`
-        : name,
-    ];
+    const existing = p.tempId ? people.find((x) => x.id === p.tempId) : undefined;
+    const name = p.displayName ?? existing?.displayName ?? "Unnamed person";
+    const bits: string[] = [];
+    if (!existing || (p.displayName && p.displayName !== existing.displayName)) {
+      bits.push(name);
+    }
+    if (p.preferredName && p.preferredName !== name) bits.push(`(${p.preferredName})`);
     if (p.birthYear) bits.push(`born ${p.birthYear}`);
     if (p.birthPlace) bits.push(`in ${p.birthPlace}`);
+    if (existing) return `Update ${existing.displayName}: ${bits.join(" ")}`;
     return `Add person: ${bits.join(" ")}`;
   }
   const nameFor = (ref?: string): string => {
@@ -142,10 +144,20 @@ export default function Home() {
         birthYear: p.birthYear ?? null,
         birthPlace: p.birthPlace ?? null,
       }));
+      const rosterRelationships = relationships.map((r) => ({
+        fromPersonId: r.fromPersonId,
+        toPersonId: r.toPersonId,
+        type: r.type,
+      }));
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, roster, egoId: people[0]?.id ?? null }),
+        body: JSON.stringify({
+          message: text,
+          roster,
+          relationships: rosterRelationships,
+          egoId: people[0]?.id ?? null,
+        }),
       });
       const data = await res.json();
       setMessages((m) => [
@@ -207,6 +219,23 @@ export default function Home() {
 
     for (const p of toApply) {
       if (p.kind === "person") {
+        const target = p.tempId ? nextPeople.find((x) => x.id === p.tempId) : undefined;
+        if (target) {
+          const displayName = p.displayName ?? target.displayName;
+          const updated: Person = {
+            ...target,
+            displayName,
+            preferredName:
+              p.preferredName ??
+              (target.preferredName || (target.displayName !== displayName ? target.displayName : null)),
+            birthYear: p.birthYear ?? target.birthYear ?? null,
+            birthPlace: p.birthPlace ?? target.birthPlace ?? null,
+            bio: p.bio ?? target.bio ?? null,
+          };
+          nextPeople = nextPeople.map((x) => (x.id === target.id ? updated : x));
+          nextProps = nextProps.filter((x) => x !== p);
+          continue;
+        }
         if (!p.displayName) continue;
         const byName = nextPeople.find(
           (x) => x.displayName.toLowerCase() === p.displayName!.toLowerCase()

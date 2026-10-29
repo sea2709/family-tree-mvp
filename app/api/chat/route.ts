@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import type { Proposal, RosterPerson } from "@/lib/types";
+import type { Proposal, RosterPerson, RosterRelationship } from "@/lib/types";
 import { extractFallback } from "@/lib/extract-fallback";
 
 const SYSTEM_PROMPT = `You extract family-tree facts from ONE chat message. You do NOT chat freely.
@@ -9,6 +9,8 @@ Rules:
 - If a value is vague ("around 1960", "in the 60s"), keep the year and set the proposal confidence to "low". Do not make it exact.
 - Never merge two people with the same name. If a name could be an existing person from the roster or a new person, prefer the existing roster id ONLY on an exact case-insensitive name match; otherwise use a new tempId and set confidence to "low".
 - Resolve relative words ONLY if unambiguous: "my dad" = parent of the speaker, "my mom" = parent of the speaker. "My uncle", "my aunt", "my cousin" are AMBIGUOUS — do not guess a link; return a person proposal at most, and ask in the reply which side of the family they are on.
+- Use the "Known relationships" and each roster person's relation to the speaker to resolve references to people already in the tree. E.g. if Thuc is listed as "speaker's sibling", "my brother Thuc" or "my only sibling" means that existing id — do not ask who the parents are when they are already known, and never re-propose a relationship that is already listed. "My dad"/"my mom" refers to one of the speaker's existing parents; pick by name if the message makes it clear, otherwise ask which one.
+- To add or correct details of a person already in the roster (full name, birth year, place), emit a "person" proposal whose tempId is that person's existing roster id, with only the stated fields set. Never create a new tempId for someone who is already in the roster.
 - Pronouns ("he", "she", "they") refer to the most recent person in this message only. If unclear, ask in the reply instead of guessing.
 - Handle these phrasings exactly like "My dad is X": "My dad name is X", "My dad's name is X", "My mom name is X", "I have a brother, his name is X", "I have a sister, her name is X", and "My name is Dang, full name is Tran Hai Dang".
 - If a name is given as "Hoa (Tran Hieu Hoa)" or "Tran Hieu Hoa (Hoa)", use the full name as displayName and the short name as preferredName.
@@ -29,6 +31,13 @@ type OllamaProposal = Proposal & { [key: string]: unknown };
 
 function log(...args: unknown[]) {
   console.log(`[chat ${new Date().toISOString().slice(11, 23)}]`, ...args);
+}
+
+function indent(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => `    | ${line}`)
+    .join("\n");
 }
 
 function preview(text: string, max = 120): string {
@@ -56,7 +65,7 @@ function nsToMs(ns: unknown): string {
   return typeof ns === "number" ? `${Math.round(ns / 1e6)}ms` : "?";
 }
 
-function normalizeProposals(raw: unknown): Proposal[] {
+function normalizeProposals(raw: unknown, roster: RosterPerson[]): Proposal[] {
   if (!Array.isArray(raw)) return [];
   const out: Proposal[] = [];
   raw.forEach((item, i) => {
@@ -67,11 +76,14 @@ function normalizeProposals(raw: unknown): Proposal[] {
       p.confidence === "high" || p.confidence === "medium" || p.confidence === "low"
         ? p.confidence
         : "medium";
+    const tempId = typeof p.tempId === "string" ? p.tempId : undefined;
+    // Updates to an existing person often carry only the changed fields.
+    const rosterName = tempId ? roster.find((r) => r.id === tempId)?.displayName : undefined;
     out.push({
       id: typeof p.id === "string" && p.id ? p.id : `ollama-${i}`,
       kind: p.kind,
-      tempId: typeof p.tempId === "string" ? p.tempId : undefined,
-      displayName: typeof p.displayName === "string" ? p.displayName : undefined,
+      tempId,
+      displayName: typeof p.displayName === "string" && p.displayName.trim() ? p.displayName : rosterName,
       preferredName: typeof p.preferredName === "string" ? p.preferredName : null,
       birthYear: typeof p.birthYear === "number" ? p.birthYear : null,
       birthPlace: typeof p.birthPlace === "string" ? p.birthPlace : null,
@@ -91,9 +103,88 @@ function normalizeProposals(raw: unknown): Proposal[] {
   return out;
 }
 
+function normalizeRelationships(raw: unknown, roster: RosterPerson[]): RosterRelationship[] {
+  if (!Array.isArray(raw)) return [];
+  const ids = new Set(roster.map((p) => p.id));
+  return raw.filter(
+    (r): r is RosterRelationship =>
+      !!r &&
+      typeof r === "object" &&
+      ids.has(r.fromPersonId) &&
+      ids.has(r.toPersonId) &&
+      (r.type === "PARENT_OF" || r.type === "SPOUSE_OF" || r.type === "PARTNER_OF")
+  );
+}
+
+// Labels each person relative to the speaker so the model can resolve
+// "my dad" / "my brother" to an existing id instead of asking again.
+function relationToEgo(
+  personId: string,
+  egoId: string | null,
+  rels: RosterRelationship[]
+): string | null {
+  if (!egoId) return null;
+  if (personId === egoId) return "the speaker";
+  const parentsOf = (id: string) =>
+    rels.filter((r) => r.type === "PARENT_OF" && r.toPersonId === id).map((r) => r.fromPersonId);
+  const egoParents = parentsOf(egoId);
+  if (egoParents.includes(personId)) return "speaker's parent";
+  if (parentsOf(personId).includes(egoId)) return "speaker's child";
+  const partner = rels.find(
+    (r) =>
+      r.type !== "PARENT_OF" &&
+      ((r.fromPersonId === egoId && r.toPersonId === personId) ||
+        (r.toPersonId === egoId && r.fromPersonId === personId))
+  );
+  if (partner) return partner.type === "SPOUSE_OF" ? "speaker's spouse" : "speaker's partner";
+  if (parentsOf(personId).some((id) => egoParents.includes(id))) return "speaker's sibling";
+  if (egoParents.some((id) => parentsOf(id).includes(personId))) return "speaker's grandparent";
+  return null;
+}
+
+function buildUserPrompt(
+  message: string,
+  roster: RosterPerson[],
+  rels: RosterRelationship[],
+  egoId: string | null
+): string {
+  const nameOf = (id: string) => roster.find((p) => p.id === id)?.displayName ?? id;
+  const people =
+    roster.length > 0
+      ? roster
+          .map((p) => {
+            const aka = p.preferredName && p.preferredName !== p.displayName ? ` (${p.preferredName})` : "";
+            const born = p.birthYear ? `, born ${p.birthYear}` : "";
+            const place = p.birthPlace ? ` in ${p.birthPlace}` : "";
+            const relation = relationToEgo(p.id, egoId, rels);
+            return `- ${p.id}: ${p.displayName}${aka}${born}${place}${relation ? ` — ${relation}` : ""}`;
+          })
+          .join("\n")
+      : "- (none yet)";
+  const edges =
+    rels.length > 0
+      ? rels
+          .map((r) => `- ${nameOf(r.fromPersonId)} (${r.fromPersonId}) ${r.type} ${nameOf(r.toPersonId)} (${r.toPersonId})`)
+          .join("\n")
+      : "- (none yet)";
+  return [
+    `Existing people (roster: id, name (preferred name), birth year/place if known, relation to speaker):`,
+    people,
+    ``,
+    `Known relationships already in the tree (do NOT propose these again):`,
+    edges,
+    ``,
+    `Speaker (ego) id: ${egoId ?? "(not set yet — the first 'I am ...' person is the speaker)"}`,
+    ``,
+    `New message to extract from:`,
+    message,
+  ].join("\n");
+}
+
 async function tryOllama(
   message: string,
   roster: RosterPerson[],
+  rels: RosterRelationship[],
   egoId: string | null
 ): Promise<{ reply: string; proposals: Proposal[]; modelUsed: string } | null> {
   const host = process.env.OLLAMA_HOST || "http://localhost:11434";
@@ -102,23 +193,9 @@ async function tryOllama(
   const timer = setTimeout(() => controller.abort(), 90_000);
   const started = Date.now();
   try {
-    const userPrompt = [
-      `Existing people (roster, id + name + birth year/place if known):`,
-      roster.length > 0
-        ? roster
-            .map(
-              (p) =>
-                `- ${p.id}: ${p.displayName}${p.birthYear ? `, born ${p.birthYear}` : ""}${p.birthPlace ? ` in ${p.birthPlace}` : ""}`
-            )
-            .join("\n")
-        : "- (none yet)",
-      `Speaker (ego) id: ${egoId ?? "(not set yet — the first 'I am ...' person is the speaker)"}`,
-      ``,
-      `New message to extract from:`,
-      message,
-    ].join("\n");
+    const userPrompt = buildUserPrompt(message, roster, rels, egoId);
 
-    log(`ollama → ${host} model=${model}, prompt ${userPrompt.length} chars`);
+    log(`ollama → ${host} model=${model}, prompt ${userPrompt.length} chars:\n${indent(userPrompt)}`);
     const res = await fetch(`${host.replace(/\/$/, "")}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -165,7 +242,7 @@ async function tryOllama(
       return null;
     }
     const rawCount = Array.isArray(parsed.proposals) ? parsed.proposals.length : 0;
-    const proposals = normalizeProposals(parsed.proposals);
+    const proposals = normalizeProposals(parsed.proposals, roster);
     log(`ollama proposals: ${proposals.length} kept of ${rawCount} returned`);
     const reply =
       typeof parsed.reply === "string" && parsed.reply.trim()
@@ -191,6 +268,7 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
     const message = typeof body.message === "string" ? body.message : "";
     const roster: RosterPerson[] = Array.isArray(body.roster) ? body.roster : [];
+    const relationships = normalizeRelationships(body.relationships, roster);
     const egoId = typeof body.egoId === "string" ? body.egoId : null;
     if (!message.trim()) {
       return NextResponse.json({
@@ -203,8 +281,10 @@ export async function POST(req: Request) {
     // Ollama first (open-weight model, local when OLLAMA_HOST is
     // localhost). Any failure — not running, bad JSON, timeout —
     // falls through to the deterministic fallback. Never crash.
-    log(`request: "${preview(message)}" (roster ${roster.length}, ego ${egoId ?? "none"})`);
-    const ollama = await tryOllama(message, roster, egoId);
+    log(
+      `request (roster ${roster.length}, relationships ${relationships.length}, ego ${egoId ?? "none"}):\n${indent(message)}`
+    );
+    const ollama = await tryOllama(message, roster, relationships, egoId);
     if (ollama) {
       logProposals(ollama.modelUsed, ollama.proposals);
       return NextResponse.json(ollama);

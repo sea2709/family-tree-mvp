@@ -1,207 +1,416 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import type { ChatMessage, Person, Proposal, Relationship } from "@/lib/types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ChatMessage, Gender, Person, Proposal, Relationship } from "@/lib/types";
 import {
+  familyConnectors,
   getChildren,
   getParents,
   getSiblings,
   getSpouses,
   layoutTree,
+  relationLabel,
+  type LayoutSize,
 } from "@/lib/tree";
+import {
+  applyProposalBatch,
+  batchOf,
+  describeProposal,
+  initials,
+  rejectProposalBatch,
+  sameNamePerson,
+  scopeBatch,
+  uid,
+  type TreeState,
+} from "@/lib/proposals";
 
 const STORAGE_KEY = "family-tree-mvp-v1";
-const EXAMPLE =
-  "I'm Lan. My dad is Minh, born 1960 in Hanoi. He married my mom, Hoa.";
+const CHAT_KEY = "family-tree-mvp-v1-chat";
+const LAYOUT_KEY = "family-tree-mvp-v1-layout";
+const SNAP = 8;
+const EXAMPLE = "I'm Lan. My dad is Minh, born 1960 in Hanoi. He married my mom, Hoa.";
+const SIZE: LayoutSize = { nodeW: 184, nodeH: 64, hGap: 24, vGap: 64 };
+const PAD = 32;
 
-function uid(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
+type Message = ChatMessage & { batchId?: string; tone?: "error" | "muted" };
+type RelativeKind = "parent" | "partner" | "child" | "sibling";
+type Toast = { label: string; onUndo?: () => void };
+type Point = { x: number; y: number };
+type DragState = { id: string; startX: number; startY: number; origin: Point; at: Point; moved: boolean };
+type QuickAdd = { kind: RelativeKind; name: string; withPartner: boolean };
+
+const KIND_LABEL: Record<RelativeKind, string> = {
+  parent: "Parent",
+  partner: "Partner",
+  child: "Child",
+  sibling: "Sibling",
+};
+
+function modelLabel(note: string | null): string {
+  if (!note) return "Local AI or offline parser";
+  if (note.startsWith("ollama:")) return `Local AI · ${note.slice("ollama:".length)}`;
+  return "Offline parser";
+}
+
+function personMeta(p: Pick<Person, "birthYear" | "birthPlace">): string {
+  return [p.birthYear ? `b. ${p.birthYear}` : null, p.birthPlace].filter(Boolean).join(" · ");
+}
+
+function relativeEdges(
+  anchorId: string,
+  newId: string,
+  kind: RelativeKind,
+  rels: Relationship[],
+  coParentId: string | null
+): Relationship[] {
+  const edge = (from: string, to: string, type: Relationship["type"]): Relationship => ({
+    id: uid(),
+    fromPersonId: from,
+    toPersonId: to,
+    type,
+  });
+  if (kind === "parent") return [edge(newId, anchorId, "PARENT_OF")];
+  if (kind === "partner") return [edge(anchorId, newId, "SPOUSE_OF")];
+  if (kind === "child") {
+    return [anchorId, coParentId]
+      .filter((id): id is string => !!id)
+      .map((id) => edge(id, newId, "PARENT_OF"));
   }
-  return `id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  // A sibling shares the anchor's parents when they are known, so the
+  // tree draws them under the same family bar.
+  const parentIds = rels
+    .filter((r) => r.type === "PARENT_OF" && r.toPersonId === anchorId)
+    .map((r) => r.fromPersonId);
+  return parentIds.length > 0
+    ? parentIds.map((id) => edge(id, newId, "PARENT_OF"))
+    : [edge(anchorId, newId, "SIBLING_OF")];
 }
 
-function initials(name: string): string {
-  return name
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((w) => w[0]?.toUpperCase() ?? "")
-    .join("");
-}
-
-// Models reuse ids like "p1" / "temp-minh" every turn, so cards left
-// pending from an earlier turn would collide with the new batch.
-// Existing person ids are left alone.
-function scopeBatch(batch: Proposal[], people: Person[]): Proposal[] {
-  const prefix = uid().slice(0, 8);
-  const existing = new Set(people.map((p) => p.id));
-  const rename = new Map<string, string>();
-  for (const p of batch) {
-    if (p.kind === "person" && p.tempId && !existing.has(p.tempId)) {
-      rename.set(p.tempId, `${prefix}:${p.tempId}`);
-    }
-  }
-  const scoped = (ref?: string) => (ref ? rename.get(ref) ?? ref : ref);
-  return batch.map((p) => ({
-    ...p,
-    id: `${prefix}:${p.id}`,
-    tempId: scoped(p.tempId),
-    fromRef: scoped(p.fromRef),
-    toRef: scoped(p.toRef),
-  }));
-}
-
-// A new-person card whose name matches someone already in the tree.
-function sameNamePerson(p: Proposal, people: Person[]): Person | undefined {
-  if (p.kind !== "person" || !p.displayName) return undefined;
-  if (p.tempId && people.some((x) => x.id === p.tempId)) return undefined;
-  const names = [p.displayName, p.preferredName]
-    .filter((n): n is string => !!n)
-    .map((n) => n.toLowerCase());
-  return people.find(
-    (x) =>
-      names.includes(x.displayName.toLowerCase()) ||
-      (!!x.preferredName && names.includes(x.preferredName.toLowerCase()))
-  );
-}
-
-// True when `ancestorId` is `personId` or one of their parents, grandparents…
-function isAncestor(ancestorId: string, personId: string, rels: Relationship[]): boolean {
-  const seen = new Set<string>();
-  const stack = [personId];
-  while (stack.length) {
-    const id = stack.pop() as string;
-    if (id === ancestorId) return true;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    for (const r of rels) {
-      if (r.type === "PARENT_OF" && r.toPersonId === id) stack.push(r.fromPersonId);
-    }
-  }
-  return false;
-}
-
-function describeProposal(
-  p: Proposal,
-  people: Person[],
-  proposals: Proposal[],
-  resolved: Record<string, string>
-): string {
-  if (p.kind === "person") {
-    const existing = p.tempId ? people.find((x) => x.id === p.tempId) : undefined;
-    const name = p.displayName ?? existing?.displayName ?? "Unnamed person";
-    const bits: string[] = [];
-    if (!existing || (p.displayName && p.displayName !== existing.displayName)) {
-      bits.push(name);
-    }
-    if (p.preferredName && p.preferredName !== name) bits.push(`(${p.preferredName})`);
-    if (p.birthYear) bits.push(`born ${p.birthYear}`);
-    if (p.birthPlace) bits.push(`in ${p.birthPlace}`);
-    if (existing) return `Update ${existing.displayName}: ${bits.join(" ")}`;
-    return `Add person: ${bits.join(" ")}`;
-  }
-  const nameFor = (ref?: string): string => {
-    if (!ref) return "someone";
-    const existing = people.find((x) => x.id === (resolved[ref] ?? ref));
-    if (existing) return existing.displayName;
-    const pending = proposals.find((x) => x.kind === "person" && x.tempId === ref);
-    return pending?.displayName ?? "someone";
-  };
-  const from = nameFor(p.fromRef);
-  const to = nameFor(p.toRef);
-  if (p.relationshipType === "PARENT_OF") return `${from} is a parent of ${to}`;
-  if (p.relationshipType === "SPOUSE_OF") return `${from} is married to ${to}`;
-  if (p.relationshipType === "PARTNER_OF") return `${from} is a partner of ${to}`;
-  if (p.relationshipType === "SIBLING_OF") return `${from} is a sibling of ${to}`;
-  return `${from} is related to ${to}`;
+// Avatars are stored as data URLs in localStorage, which caps out at a
+// few MB; a phone photo would silently stop the tree from saving.
+function shrinkImage(file: File, size = 160): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return reject(new Error("no canvas"));
+      const side = Math.min(img.width, img.height);
+      ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL("image/jpeg", 0.85));
+    };
+    img.onerror = reject;
+    img.src = url;
+  });
 }
 
 export default function Home() {
   const [people, setPeople] = useState<Person[]>([]);
   const [relationships, setRelationships] = useState<Relationship[]>([]);
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: "welcome",
-      role: "assistant",
-      text: "Hi! Who are you in this tree? Tell me about yourself first, then your parents — for example, try the example prompt below.",
-    },
-  ]);
-  const [proposals, setProposals] = useState<Proposal[]>([]);
-  // tempId -> person id for person proposals already accepted, so a
-  // relationship card accepted later still knows who it points at.
-  const [resolvedRefs, setResolvedRefs] = useState<Record<string, string>>({});
-  // The speaker, set once from the first chat batch and then kept
-  // stable. Previously egoId was people[0], which changed if the
-  // user accepted proposals in a different order — so a second
-  // prompt's "my dad" could suddenly mean someone else's dad.
   const [egoId, setEgoId] = useState<string | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [proposals, setProposals] = useState<Proposal[]>([]);
+  const [resolvedRefs, setResolvedRefs] = useState<Record<string, string>>({});
   const [modelNote, setModelNote] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
 
-  const [manualName, setManualName] = useState("");
-  const [manualYear, setManualYear] = useState("");
-  const [manualPlace, setManualPlace] = useState("");
+  const [unchecked, setUnchecked] = useState<Set<string>>(new Set());
+  const [sameAs, setSameAs] = useState<Record<string, string>>({});
+  const [hoverId, setHoverId] = useState<string | null>(null);
 
-  const [detailBio, setDetailBio] = useState("");
-  const [relativeType, setRelativeType] = useState<"parent" | "spouse" | "child">("parent");
-  const [relativeName, setRelativeName] = useState("");
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [quickAdd, setQuickAdd] = useState<QuickAdd | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [toast, setToast] = useState<Toast | null>(null);
+  const [recentIds, setRecentIds] = useState<Set<string>>(new Set());
+  const [zoom, setZoom] = useState(1);
+  // Positions the user dragged to, in layout coordinates. People
+  // without an entry keep their auto-layout spot.
+  const [manualPos, setManualPos] = useState<Record<string, Point>>({});
+  const [drag, setDrag] = useState<DragState | null>(null);
+  // Pointer events can fire faster than React re-renders, so handlers
+  // read the live drag from this ref; `drag` state is only for paint.
+  const dragRef = useRef<DragState | null>(null);
+  const suppressClick = useRef(false);
+  const [mobileTab, setMobileTab] = useState<"chat" | "tree">("chat");
+
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLDivElement>(null);
 
   // Load persisted state (client only, to avoid hydration mismatch).
   useEffect(() => {
+    let savedPeople: Person[] = [];
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed.people)) setPeople(parsed.people);
+        if (Array.isArray(parsed.people)) savedPeople = parsed.people;
         if (Array.isArray(parsed.relationships)) setRelationships(parsed.relationships);
         if (typeof parsed.egoId === "string") setEgoId(parsed.egoId);
+      }
+      setPeople(savedPeople);
+      const chatRaw = localStorage.getItem(CHAT_KEY);
+      if (chatRaw) {
+        const chat = JSON.parse(chatRaw);
+        if (Array.isArray(chat.messages)) setMessages(chat.messages);
+        if (Array.isArray(chat.proposals)) setProposals(chat.proposals);
+        if (chat.resolvedRefs && typeof chat.resolvedRefs === "object") setResolvedRefs(chat.resolvedRefs);
+        if (typeof chat.modelNote === "string") setModelNote(chat.modelNote);
+      }
+      const layoutRaw = localStorage.getItem(LAYOUT_KEY);
+      if (layoutRaw) {
+        const layout = JSON.parse(layoutRaw);
+        if (layout && typeof layout === "object") setManualPos(layout);
       }
     } catch {
       // Corrupt storage: start fresh rather than crashing.
     }
+    setMessages((m) =>
+      m.length > 0
+        ? m
+        : [
+            {
+              id: "welcome",
+              role: "assistant",
+              text:
+                savedPeople.length > 0
+                  ? `Welcome back — your tree has ${savedPeople.length} ${savedPeople.length === 1 ? "person" : "people"}. Tell me about someone new, or click a person to edit them.`
+                  : "Hi! Let's start with you. Tell me your name, then your parents — like the example below.",
+            },
+          ]
+    );
     setLoaded(true);
   }, []);
 
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({ people, relationships, egoId })
-      );
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ people, relationships, egoId }));
     } catch {
-      // localStorage full (e.g. large avatar data URLs): ignore, tree
-      // still works for this session.
+      showToast({ label: "Couldn't save — browser storage is full." });
     }
   }, [people, relationships, egoId, loaded]);
 
-  const selected = people.find((p) => p.id === selectedId) ?? null;
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(
+        CHAT_KEY,
+        JSON.stringify({ messages: messages.slice(-60), proposals, resolvedRefs, modelNote })
+      );
+    } catch {
+      // Chat history is a convenience; the tree itself is saved above.
+    }
+  }, [messages, proposals, resolvedRefs, modelNote, loaded]);
 
   useEffect(() => {
-    setDetailBio(selected?.bio ?? "");
-  }, [selected?.id, selected?.bio]);
+    if (!loaded) return;
+    try {
+      const live = new Set(people.map((p) => p.id));
+      const kept = Object.fromEntries(Object.entries(manualPos).filter(([id]) => live.has(id)));
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(kept));
+    } catch {
+      // Positions are cosmetic; auto-layout still works without them.
+    }
+  }, [manualPos, people, loaded]);
 
-  const positioned = useMemo(() => layoutTree(people, relationships), [people, relationships]);
-  const posById = useMemo(() => new Map(positioned.map((p) => [p.id, p])), [positioned]);
-  const canvasWidth = positioned.length > 0 ? Math.max(...positioned.map((p) => p.x)) + 190 : 400;
-  const canvasHeight = positioned.length > 0 ? Math.max(...positioned.map((p) => p.y)) + 104 : 200;
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ block: "end" });
+  }, [messages.length, proposals.length, loading]);
 
-  const parents = selected ? getParents(selected.id, people, relationships) : [];
-  const spouses = selected ? getSpouses(selected.id, people, relationships) : [];
-  const children = selected ? getChildren(selected.id, people, relationships) : [];
-  const siblings = selected ? getSiblings(selected.id, people, relationships) : [];
+  useEffect(() => {
+    if (!loading) return;
+    const started = Date.now();
+    setElapsed(0);
+    const t = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(t);
+  }, [loading]);
 
-  async function sendChat(e: React.FormEvent) {
-    e.preventDefault();
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 6000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  useEffect(() => {
+    if (recentIds.size === 0) return;
+    const t = setTimeout(() => setRecentIds(new Set()), 2400);
+    return () => clearTimeout(t);
+  }, [recentIds]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (showAdd) setShowAdd(false);
+      else if (quickAdd) setQuickAdd(null);
+      else setSelectedId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showAdd, quickAdd]);
+
+  useEffect(() => {
+    setQuickAdd(null);
+  }, [selectedId]);
+
+  function showToast(t: Toast) {
+    setToast(t);
+  }
+
+  const snapshot = (): TreeState => ({ people, relationships, proposals, resolvedRefs, egoId });
+
+  function commit(next: TreeState, label: string | null, before?: TreeState) {
+    setPeople(next.people);
+    setRelationships(next.relationships);
+    setProposals(next.proposals);
+    setResolvedRefs(next.resolvedRefs);
+    setEgoId(next.egoId);
+    if (label) showToast({ label, onUndo: before ? () => commit(before, null) : undefined });
+  }
+
+  function undo() {
+    toast?.onUndo?.();
+    setToast(null);
+  }
+
+  // --- Proposal review -------------------------------------------------
+
+  const uncheckedRefs = useMemo(
+    () =>
+      new Set(
+        proposals
+          .filter((p) => p.kind === "person" && p.tempId && unchecked.has(p.id))
+          .map((p) => p.tempId as string)
+      ),
+    [proposals, unchecked]
+  );
+
+  const isChecked = (p: Proposal) =>
+    !unchecked.has(p.id) &&
+    !(p.kind === "relationship" &&
+      ((p.fromRef && uncheckedRefs.has(p.fromRef)) || (p.toRef && uncheckedRefs.has(p.toRef))));
+
+  function toggle(p: Proposal) {
+    setUnchecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(p.id)) next.delete(p.id);
+      else next.add(p.id);
+      return next;
+    });
+  }
+
+  // The tree shows checked proposals as dashed "ghost" nodes, so the
+  // user sees where people will land before they accept anything.
+  const preview = useMemo(() => {
+    const existing = new Set(people.map((p) => p.id));
+    const alias: Record<string, string> = { ...resolvedRefs };
+    const pendingPeople: Person[] = [];
+    const pendingIds = new Set<string>();
+    const updatingIds = new Set<string>();
+    for (const p of proposals) {
+      if (p.kind !== "person" || !isChecked(p)) continue;
+      const merge = sameAs[p.id];
+      const target = merge ?? (p.tempId ? alias[p.tempId] ?? p.tempId : undefined);
+      if (target && existing.has(target)) {
+        if (p.tempId) alias[p.tempId] = target;
+        updatingIds.add(target);
+        continue;
+      }
+      if (!p.displayName) continue;
+      const id = p.tempId ?? p.id;
+      pendingPeople.push({
+        id,
+        displayName: p.displayName,
+        birthYear: p.birthYear ?? null,
+        birthPlace: p.birthPlace ?? null,
+        gender: p.gender ?? null,
+      });
+      pendingIds.add(id);
+    }
+    const known = (id: string) => existing.has(id) || pendingIds.has(id);
+    const pendingRels: Relationship[] = [];
+    for (const p of proposals) {
+      if (p.kind !== "relationship" || !isChecked(p) || !p.relationshipType) continue;
+      const from = p.fromRef ? alias[p.fromRef] ?? p.fromRef : null;
+      const to = p.toRef ? alias[p.toRef] ?? p.toRef : null;
+      if (!from || !to || from === to || !known(from) || !known(to)) continue;
+      pendingRels.push({ id: p.id, fromPersonId: from, toPersonId: to, type: p.relationshipType });
+    }
+    const proposalByNode = new Map<string, string>();
+    for (const p of proposals) {
+      if (p.kind !== "person") continue;
+      const node = sameAs[p.id] ?? (p.tempId ? alias[p.tempId] ?? p.tempId : p.id);
+      proposalByNode.set(p.id, node);
+    }
+    return { pendingPeople, pendingIds, updatingIds, pendingRels, proposalByNode };
+    // isChecked is derived from unchecked + uncheckedRefs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [people, proposals, resolvedRefs, sameAs, unchecked, uncheckedRefs]);
+
+  const allPeople = useMemo(() => [...people, ...preview.pendingPeople], [people, preview]);
+  const allRels = useMemo(() => [...relationships, ...preview.pendingRels], [relationships, preview]);
+  const viewEgo =
+    egoId ??
+    proposals.find((p) => p.isSpeaker && isChecked(p))?.tempId ??
+    null;
+
+  function acceptBatch(batchId: string) {
+    const items = proposals.filter((p) => batchOf(p) === batchId);
+    const chosen = items
+      .filter(isChecked)
+      .map((p) => (sameAs[p.id] ? { ...p, existingPersonId: sameAs[p.id] } : p));
+    const dropped = items.filter((p) => !isChecked(p));
+    const before = snapshot();
+    const { next, skipped } = applyProposalBatch(before, chosen);
+    const after = { ...next, proposals: rejectProposalBatch(next, dropped) };
+    const added = after.people.filter((p) => !before.people.some((x) => x.id === p.id));
+    const links = after.relationships.length - before.relationships.length;
+    commit(
+      after,
+      [
+        added.length ? `Added ${added.length} ${added.length === 1 ? "person" : "people"}` : null,
+        links ? `${links} ${links === 1 ? "link" : "links"}` : null,
+      ]
+        .filter(Boolean)
+        .join(" and ") || "Tree updated",
+      before
+    );
+    setRecentIds(new Set(added.map((p) => p.id)));
+    if (skipped.length) {
+      setMessages((m) => [
+        ...m,
+        ...skipped.map((text) => ({ id: uid(), role: "assistant" as const, text, tone: "error" as const })),
+      ]);
+    }
+  }
+
+  function discardBatch(batchId: string) {
+    const before = snapshot();
+    const items = proposals.filter((p) => batchOf(p) === batchId);
+    commit({ ...before, proposals: rejectProposalBatch(before, items) }, "Suggestions discarded", before);
+  }
+
+  // --- Chat ------------------------------------------------------------
+
+  async function sendChat(e?: React.FormEvent) {
+    e?.preventDefault();
     const text = input.trim();
     if (!text || loading) return;
     setMessages((m) => [...m, { id: uid(), role: "user", text }]);
     setInput("");
     setLoading(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       const roster = people.map((p) => ({
         id: p.id,
@@ -211,22 +420,18 @@ export default function Home() {
         birthPlace: p.birthPlace ?? null,
         gender: p.gender ?? null,
       }));
-      // Send the whole graph, not just the roster: without the
-      // edges, a second prompt cannot be resolved ("my dad's
-      // brother" needs to know who "my dad" is). History is sent
-      // too, so pronouns and "my dad" in a later turn resolve
-      // against what the user already said.
       const graph = relationships.map((r) => ({
         fromPersonId: r.fromPersonId,
         toPersonId: r.toPersonId,
         type: r.type,
       }));
-      const history = [...messages, { id: "current", role: "user" as const, text }]
+      const history = [...messages.filter((m) => !m.tone), { role: "user" as const, text }]
         .slice(-8)
         .map((m) => ({ role: m.role, text: m.text }));
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           message: text,
           roster,
@@ -236,557 +441,916 @@ export default function Home() {
         }),
       });
       const data = await res.json();
+      const prefix = uid().slice(0, 8);
+      const batch = Array.isArray(data.proposals)
+        ? scopeBatch(data.proposals as Proposal[], people, prefix)
+        : [];
       setMessages((m) => [
         ...m,
         {
           id: uid(),
           role: "assistant",
-          text: typeof data.reply === "string" ? data.reply : "Please review the proposals below.",
+          text:
+            typeof data.reply === "string"
+              ? data.reply
+              : batch.length
+                ? "Here's what I understood — check it before it goes in the tree."
+                : "I didn't find anyone new in that. Try naming the person and how they're related to you.",
+          batchId: batch.length ? prefix : undefined,
         },
       ]);
-      if (Array.isArray(data.proposals)) {
-        setProposals((prev) => [...prev, ...scopeBatch(data.proposals as Proposal[], people)]);
+      if (batch.length) {
+        setProposals((prev) => [...prev, ...batch]);
+        setUnchecked((prev) => {
+          const next = new Set(prev);
+          for (const p of batch) if (p.confidence === "low") next.add(p.id);
+          return next;
+        });
+        setMobileTab("chat");
       }
       if (typeof data.modelUsed === "string") setModelNote(data.modelUsed);
-    } catch {
+    } catch (err) {
+      const aborted = err instanceof DOMException && err.name === "AbortError";
       setMessages((m) => [
         ...m,
         {
           id: uid(),
           role: "assistant",
-          text: "Sorry, I couldn't reach the chat service. You can still add people manually on the right.",
+          tone: aborted ? "muted" : "error",
+          text: aborted
+            ? "Stopped. Your message is back in the box if you want to edit it."
+            : "I couldn't reach the chat service. Your message is back in the box — try again, or add people by hand with “+ Person”.",
         },
       ]);
+      setInput((cur) => cur || text);
     } finally {
+      abortRef.current = null;
       setLoading(false);
     }
   }
 
-  // Apply one or more proposals, resolving tempIds / existing ids.
-  function applyProposals(toApply: Proposal[]) {
-    let nextPeople = [...people];
-    let nextRels = [...relationships];
-    let nextProps = [...proposals];
-    const nextResolved = { ...resolvedRefs };
-    let nextEgo = egoId;
-    let lastCreatedId: string | null = null;
-    const skipped: string[] = [];
+  const selected = people.find((p) => p.id === selectedId) ?? null;
+  const firstName = (p: Person) => p.preferredName || p.displayName.split(/\s+/).slice(-1)[0];
+  const ego = people.find((p) => p.id === egoId) ?? null;
 
-    // Accepts one person proposal: an update when its tempId (or
-    // existingPersonId) is an existing id, otherwise a new person.
-    // Either way the tempId is remembered for later cards.
-    // Same-name people are never merged silently ("my son Minh" is not
-    // "my dad Minh"); the card's "Same as existing" button sets
-    // existingPersonId when the user says they are one person.
-    const acceptPerson = (p: Proposal): string | null => {
-      nextProps = nextProps.filter((x) => x.id !== p.id);
-      let id: string | null = null;
-      const targetId = p.existingPersonId ?? p.tempId;
-      const target = targetId ? nextPeople.find((x) => x.id === targetId) : undefined;
-      if (target) {
-        const displayName = p.existingPersonId ? target.displayName : p.displayName ?? target.displayName;
-        const updated: Person = {
-          ...target,
-          displayName,
-          preferredName:
-            (p.existingPersonId ? null : p.preferredName) ??
-            (target.preferredName || (target.displayName !== displayName ? target.displayName : null)),
-          birthYear: p.birthYear ?? target.birthYear ?? null,
-          birthPlace: p.birthPlace ?? target.birthPlace ?? null,
-          bio: p.bio ?? target.bio ?? null,
-          gender: target.gender ?? p.gender ?? null,
-        };
-        nextPeople = nextPeople.map((x) => (x.id === target.id ? updated : x));
-        id = target.id;
-      } else if (p.displayName) {
-        const created: Person = {
-          id: uid(),
-          displayName: p.displayName,
-          preferredName: p.preferredName ?? null,
-          birthYear: p.birthYear ?? null,
-          birthPlace: p.birthPlace ?? null,
-          bio: p.bio ?? null,
-          gender: p.gender ?? null,
-        };
-        nextPeople = [...nextPeople, created];
-        lastCreatedId = created.id;
-        id = created.id;
-      }
-      if (id && p.tempId) nextResolved[p.tempId] = id;
-      // Only the speaker's own card sets the ego, and only once, so
-      // accepting "Minh" before "Lan" does not make Minh the speaker.
-      if (id && p.isSpeaker && !nextEgo) nextEgo = id;
-      return id;
-    };
-
-    const ensurePerson = (ref?: string): string | null => {
-      if (!ref) return null;
-      const mapped = nextResolved[ref] ?? ref;
-      if (nextPeople.some((x) => x.id === mapped)) return mapped;
-      const pending = nextProps.find((x) => x.kind === "person" && x.tempId === ref);
-      return pending ? acceptPerson(pending) : null;
-    };
-
-    for (const p of toApply) {
-      if (!nextProps.some((x) => x.id === p.id)) continue;
-      if (p.kind === "person") {
-        acceptPerson(p);
-      } else if (p.kind === "relationship") {
-        const fromId = ensurePerson(p.fromRef);
-        const toId = ensurePerson(p.toRef);
-        if (fromId && toId && fromId !== toId) {
-          const duplicate = nextRels.some(
-            (r) =>
-              r.type === p.relationshipType &&
-              ((r.fromPersonId === fromId && r.toPersonId === toId) ||
-                (p.relationshipType !== "PARENT_OF" &&
-                  r.fromPersonId === toId &&
-                  r.toPersonId === fromId))
-          );
-          const cycle =
-            p.relationshipType === "PARENT_OF" && isAncestor(toId, fromId, nextRels);
-          if (cycle) {
-            const name = (id: string) => nextPeople.find((x) => x.id === id)?.displayName ?? "?";
-            skipped.push(
-              `I didn't add "${name(fromId)} is a parent of ${name(toId)}" because ${name(toId)} is already ${name(fromId)}'s parent or ancestor. If these are different people, add them separately.`
-            );
-          } else if (!duplicate && p.relationshipType) {
-            nextRels = [
-              ...nextRels,
-              { id: uid(), fromPersonId: fromId, toPersonId: toId, type: p.relationshipType },
-            ];
-          }
-        }
-        nextProps = nextProps.filter((x) => x.id !== p.id);
-      }
+  const suggestions: string[] = useMemo(() => {
+    if (people.length === 0) return [EXAMPLE, "My name is "];
+    if (selected) {
+      const n = firstName(selected);
+      return [`${n}'s parents are `, `${n} is married to `, `${n}'s children are `];
     }
-
-    setPeople(nextPeople);
-    setRelationships(nextRels);
-    setProposals(nextProps);
-    setResolvedRefs(nextResolved);
-    if (lastCreatedId) setSelectedId(lastCreatedId);
-    if (nextEgo !== egoId) setEgoId(nextEgo);
-    if (skipped.length) {
-      setMessages((m) => [
-        ...m,
-        ...skipped.map((text) => ({ id: uid(), role: "assistant" as const, text })),
-      ]);
+    if (ego && getParents(ego.id, people, relationships).length === 0) {
+      return ["My parents are ", "My dad is ", "My mom is "];
     }
+    return ["My grandparents are ", "My brother is ", "My sister is "];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [people, relationships, selected, ego]);
+
+  function applySuggestion(s: string) {
+    setInput(s);
+    setMobileTab("chat");
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(s.length, s.length);
+    });
   }
 
-  // Rejecting a person also drops the relationship cards that need
-  // them; otherwise those cards could only ever be accepted as no-ops.
-  function rejectProposals(toReject: Proposal[]) {
-    const rejected = new Set(toReject);
-    const droppedRefs = new Set(
-      toReject
-        .filter((p) => p.kind === "person" && p.tempId && !resolvedRefs[p.tempId])
-        .filter((p) => !people.some((x) => x.id === p.tempId))
-        .map((p) => p.tempId as string)
+  // --- Tree editing ----------------------------------------------------
+
+  function patchPerson(id: string, patch: Partial<Person>) {
+    setPeople((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  }
+
+  function addRelative(
+    anchorId: string | null,
+    kind: RelativeKind,
+    fields: Pick<Person, "displayName" | "birthYear" | "birthPlace">,
+    coParentId: string | null = null
+  ) {
+    const before = snapshot();
+    const person: Person = { id: uid(), ...fields };
+    const edges = anchorId ? relativeEdges(anchorId, person.id, kind, relationships, coParentId) : [];
+    commit(
+      { ...before, people: [...people, person], relationships: [...relationships, ...edges] },
+      `Added ${person.displayName}`,
+      before
     );
-    setProposals((prev) =>
-      prev.filter(
-        (x) =>
-          !rejected.has(x) &&
-          !(x.kind === "relationship" &&
-            ((x.fromRef && droppedRefs.has(x.fromRef)) || (x.toRef && droppedRefs.has(x.toRef))))
-      )
-    );
-  }
-
-  function manualAdd(e: React.FormEvent) {
-    e.preventDefault();
-    const name = manualName.trim();
-    if (!name) return;
-    const year = manualYear.trim() ? Number(manualYear.trim()) : null;
-    const person: Person = {
-      id: uid(),
-      displayName: name,
-      birthYear: Number.isFinite(year) ? year : null,
-      birthPlace: manualPlace.trim() || null,
-    };
-    setPeople((prev) => [...prev, person]);
-    setSelectedId(person.id);
-    setManualName("");
-    setManualYear("");
-    setManualPlace("");
-  }
-
-  function addRelative(e: React.FormEvent) {
-    e.preventDefault();
-    if (!selected) return;
-    const name = relativeName.trim();
-    if (!name) return;
-    const person: Person = { id: uid(), displayName: name };
-    let rel: Relationship;
-    if (relativeType === "parent") {
-      rel = { id: uid(), fromPersonId: person.id, toPersonId: selected.id, type: "PARENT_OF" };
-    } else if (relativeType === "spouse") {
-      rel = { id: uid(), fromPersonId: selected.id, toPersonId: person.id, type: "SPOUSE_OF" };
-    } else {
-      rel = { id: uid(), fromPersonId: selected.id, toPersonId: person.id, type: "PARENT_OF" };
-    }
-    setPeople((prev) => [...prev, person]);
-    setRelationships((prev) => [...prev, rel]);
-    setSelectedId(person.id);
-    setRelativeName("");
-  }
-
-  function saveBio() {
-    if (!selected) return;
-    setPeople((prev) =>
-      prev.map((p) => (p.id === selected.id ? { ...p, bio: detailBio } : p))
-    );
-  }
-
-  function uploadAvatar(file: File | undefined) {
-    if (!selected || !file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const url = typeof reader.result === "string" ? reader.result : null;
-      if (!url) return;
-      setPeople((prev) =>
-        prev.map((p) => (p.id === selected.id ? { ...p, avatarUrl: url } : p))
-      );
-    };
-    reader.readAsDataURL(file);
+    setRecentIds(new Set([person.id]));
+    return person.id;
   }
 
   function deletePerson(id: string) {
-    setPeople((prev) => prev.filter((p) => p.id !== id));
-    setRelationships((prev) =>
-      prev.filter((r) => r.fromPersonId !== id && r.toPersonId !== id)
+    const before = snapshot();
+    const name = people.find((p) => p.id === id)?.displayName ?? "person";
+    commit(
+      {
+        ...before,
+        people: people.filter((p) => p.id !== id),
+        relationships: relationships.filter((r) => r.fromPersonId !== id && r.toPersonId !== id),
+        egoId: egoId === id ? null : egoId,
+      },
+      `Deleted ${name}`,
+      before
     );
-    if (selectedId === id) setSelectedId(null);
-    if (egoId === id) setEgoId(null);
+    setSelectedId(null);
+  }
+
+  async function uploadAvatar(id: string, file: File | undefined) {
+    if (!file) return;
+    try {
+      patchPerson(id, { avatarUrl: await shrinkImage(file) });
+    } catch {
+      showToast({ label: "That file couldn't be read as an image." });
+    }
+  }
+
+  function selectAndReveal(id: string) {
+    setSelectedId(id);
+    setMobileTab("tree");
+    requestAnimationFrame(() =>
+      canvasRef.current
+        ?.querySelector(`[data-id="${CSS.escape(id)}"]`)
+        ?.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" })
+    );
+  }
+
+  // --- Layout ------------------------------------------------------------
+
+  const autoPositioned = useMemo(() => layoutTree(allPeople, allRels, SIZE), [allPeople, allRels]);
+  // Dragged people sit where they were dropped. Auto-placed people
+  // (including new ghosts) slide right until they stop overlapping
+  // a dragged one, so nobody ends up hidden underneath another card.
+  const placed = useMemo(() => {
+    const overlaps = (a: Point, b: Point) =>
+      Math.abs(a.x - b.x) < SIZE.nodeW + 8 && Math.abs(a.y - b.y) < SIZE.nodeH + 8;
+    const fixed = autoPositioned
+      .filter((p) => manualPos[p.id])
+      .map((p) => ({ ...p, ...manualPos[p.id] }));
+    const out = [...fixed];
+    for (const p of autoPositioned) {
+      if (manualPos[p.id]) continue;
+      let x = p.x;
+      while (fixed.some((f) => overlaps(f, { x, y: p.y }))) x += SIZE.nodeW + SIZE.hGap;
+      out.push({ ...p, x });
+    }
+    return out;
+  }, [autoPositioned, manualPos]);
+  const positioned = useMemo(
+    () => (drag?.moved ? placed.map((p) => (p.id === drag.id ? { ...p, ...drag.at } : p)) : placed),
+    [placed, drag]
+  );
+  const hasManualLayout = people.some((p) => manualPos[p.id]);
+
+  function onNodePointerDown(e: React.PointerEvent<HTMLButtonElement>, p: Point & { id: string }) {
+    suppressClick.current = false;
+    if (e.button !== 0 || preview.pendingIds.has(p.id)) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragRef.current = {
+      id: p.id,
+      startX: e.clientX,
+      startY: e.clientY,
+      origin: { x: p.x, y: p.y },
+      at: { x: p.x, y: p.y },
+      moved: false,
+    };
+  }
+
+  function onNodePointerMove(e: React.PointerEvent<HTMLButtonElement>) {
+    const d = dragRef.current;
+    if (!d) return;
+    const dx = e.clientX - d.startX;
+    const dy = e.clientY - d.startY;
+    // A few pixels of jitter is still a click, not a drag.
+    if (!d.moved && Math.hypot(dx, dy) < 4) return;
+    const snap = (v: number) => Math.max(0, Math.round(v / SNAP) * SNAP);
+    const next = {
+      ...d,
+      moved: true,
+      at: { x: snap(d.origin.x + dx / zoom), y: snap(d.origin.y + dy / zoom) },
+    };
+    dragRef.current = next;
+    setDrag(next);
+  }
+
+  function onNodePointerUp(e: React.PointerEvent<HTMLButtonElement>) {
+    onNodePointerMove(e);
+    const d = dragRef.current;
+    dragRef.current = null;
+    setDrag(null);
+    if (!d?.moved) return;
+    setManualPos((prev) => ({ ...prev, [d.id]: d.at }));
+    suppressClick.current = true;
+  }
+
+  function onNodePointerCancel() {
+    dragRef.current = null;
+    setDrag(null);
+  }
+
+  function nudge(e: React.KeyboardEvent, p: Point & { id: string }) {
+    const step = e.shiftKey ? SNAP * 5 : SNAP;
+    const delta: Record<string, Point> = {
+      ArrowLeft: { x: -step, y: 0 },
+      ArrowRight: { x: step, y: 0 },
+      ArrowUp: { x: 0, y: -step },
+      ArrowDown: { x: 0, y: step },
+    };
+    const d = delta[e.key];
+    if (!d || preview.pendingIds.has(p.id)) return;
+    e.preventDefault();
+    setManualPos((prev) => ({ ...prev, [p.id]: { x: Math.max(0, p.x + d.x), y: Math.max(0, p.y + d.y) } }));
+  }
+
+  function resetLayout() {
+    const before = manualPos;
+    setManualPos({});
+    showToast({ label: "Layout reset", onUndo: () => setManualPos(before) });
+  }
+  const connectors = useMemo(
+    () => familyConnectors(positioned, allRels, SIZE, new Set(preview.pendingRels.map((r) => r.id))),
+    [positioned, allRels, preview.pendingRels]
+  );
+  const width = (positioned.length ? Math.max(...positioned.map((p) => p.x)) + SIZE.nodeW : 0) + PAD * 2;
+  const height = (positioned.length ? Math.max(...positioned.map((p) => p.y)) + SIZE.nodeH : 0) + PAD * 2;
+  const hoverNode = hoverId ? preview.proposalByNode.get(hoverId) ?? null : null;
+
+  function fit() {
+    const el = canvasRef.current;
+    if (!el || !positioned.length) return;
+    const scale = Math.min((el.clientWidth - 16) / width, (el.clientHeight - 16) / height);
+    setZoom(Math.max(0.4, Math.min(1.25, Math.round(scale * 20) / 20)));
+  }
+
+  const fittedOnce = useRef(false);
+  useEffect(() => {
+    if (!loaded || fittedOnce.current || people.length === 0) return;
+    fittedOnce.current = true;
+    const el = canvasRef.current;
+    if (el && (width > el.clientWidth || height > el.clientHeight)) fit();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, people.length]);
+
+  // Ghost nodes often land outside the visible area; bring the first
+  // one into view when a new batch arrives.
+  const pendingKey = [...preview.pendingIds].join("|");
+  useEffect(() => {
+    const first = [...preview.pendingIds][0];
+    if (!first) return;
+    requestAnimationFrame(() =>
+      canvasRef.current
+        ?.querySelector(`[data-id="${CSS.escape(first)}"]`)
+        ?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" })
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingKey]);
+
+  const batches = useMemo(() => {
+    const ids: string[] = [];
+    for (const p of proposals) if (!ids.includes(batchOf(p))) ids.push(batchOf(p));
+    return ids;
+  }, [proposals]);
+  const anchoredBatches = new Set(messages.map((m) => m.batchId).filter(Boolean));
+
+  // --- Render --------------------------------------------------------------
+
+  function renderBatch(batchId: string) {
+    const items = proposals.filter((p) => batchOf(p) === batchId);
+    if (!items.length) return null;
+    const count = items.filter(isChecked).length;
+    return (
+      <div className="pt-review" key={`batch-${batchId}`}>
+        <div className="pt-review-head">
+          <strong>Check before adding</strong>
+          <span>Dashed cards in the tree show where they&apos;ll go.</span>
+        </div>
+        <ul>
+          {items.map((p) => {
+            const checked = isChecked(p);
+            const lockedOff = !unchecked.has(p.id) && !checked;
+            const match = sameNamePerson(p, people);
+            const node = preview.proposalByNode.get(p.id);
+            const label = p.isSpeaker ? "You" : node ? relationLabel(viewEgo, node, allPeople, allRels) : null;
+            const existing = p.kind === "person" && p.tempId ? people.find((x) => x.id === p.tempId) : undefined;
+            return (
+              <li
+                key={p.id}
+                className={`pt-review-row ${p.kind} ${checked ? "" : "off"}`}
+                onMouseEnter={() => setHoverId(p.id)}
+                onMouseLeave={() => setHoverId(null)}
+              >
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={lockedOff}
+                    onChange={() => toggle(p)}
+                  />
+                  {p.kind === "person" ? (
+                    <span className="pt-review-body">
+                      <span className="pt-ghost-avatar">{initials(p.displayName ?? existing?.displayName ?? "?")}</span>
+                      <span>
+                        <span className="pt-review-title">
+                          {existing ? `Update ${existing.displayName}` : p.displayName}
+                          {label && <span className="pt-tag">{label}</span>}
+                        </span>
+                        <span className="pt-review-meta">
+                          {personMeta({ birthYear: p.birthYear ?? null, birthPlace: p.birthPlace ?? null }) ||
+                            (existing ? "No new details" : "New person")}
+                        </span>
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="pt-review-body pt-review-link">
+                      {describeProposal(p, people, proposals, resolvedRefs)}
+                      {lockedOff && <span className="pt-review-meta"> — needs the person above</span>}
+                    </span>
+                  )}
+                </label>
+                {p.confidence !== "high" && (
+                  <span className={`pt-conf ${p.confidence}`} title={p.reason}>
+                    {p.confidence === "low" ? "Unsure" : "Likely"}
+                  </span>
+                )}
+                <span className="pt-why" title={`Why: ${p.reason}`} aria-label={`Why: ${p.reason}`}>
+                  ?
+                </span>
+                {match && checked && (
+                  <div className="pt-same-name">
+                    <span>{match.displayName} is already in your tree.</span>
+                    <select
+                      value={sameAs[p.id] ?? ""}
+                      onChange={(e) =>
+                        setSameAs((prev) => {
+                          const next = { ...prev };
+                          if (e.target.value) next[p.id] = e.target.value;
+                          else delete next[p.id];
+                          return next;
+                        })
+                      }
+                    >
+                      <option value="">Add as a different person</option>
+                      <option value={match.id}>
+                        Same person as {match.displayName}
+                        {personMeta(match) ? ` (${personMeta(match)})` : ""}
+                      </option>
+                    </select>
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+        <div className="pt-review-actions">
+          <button className="pt-btn pt-btn-primary" disabled={count === 0} onClick={() => acceptBatch(batchId)}>
+            {count === items.length ? "Add all to tree" : `Add ${count} selected`}
+          </button>
+          <button className="pt-btn pt-btn-ghost" onClick={() => discardBatch(batchId)}>
+            Discard
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  function renderNode(p: (typeof positioned)[number]) {
+    const pending = preview.pendingIds.has(p.id);
+    const label = relationLabel(viewEgo, p.id, allPeople, allRels);
+    const classes = [
+      "pt-node",
+      pending && "pending",
+      preview.updatingIds.has(p.id) && "updating",
+      selectedId === p.id && "selected",
+      hoverNode === p.id && "hl",
+      recentIds.has(p.id) && "recent",
+      label === "You" && "ego",
+      drag?.moved && drag.id === p.id && "dragging",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return (
+      <button
+        key={p.id}
+        data-id={p.id}
+        type="button"
+        className={classes}
+        style={{ left: p.x + PAD, top: p.y + PAD, width: SIZE.nodeW, height: SIZE.nodeH }}
+        onPointerDown={(e) => onNodePointerDown(e, p)}
+        onPointerMove={onNodePointerMove}
+        onPointerUp={onNodePointerUp}
+        onPointerCancel={onNodePointerCancel}
+        onKeyDown={(e) => nudge(e, p)}
+        onClick={() => {
+          if (suppressClick.current) {
+            suppressClick.current = false;
+            return;
+          }
+          if (!pending) setSelectedId(p.id === selectedId ? null : p.id);
+        }}
+        title={
+          pending
+            ? `${p.displayName} — waiting for your review in chat`
+            : `${p.displayName} — drag to move, or use arrow keys`
+        }
+      >
+        {p.avatarUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img className="pt-avatar" src={p.avatarUrl} alt="" />
+        ) : (
+          <span className="pt-avatar pt-initials">{initials(p.displayName)}</span>
+        )}
+        <span className="pt-node-text">
+          <span className="pt-node-name">{p.displayName}</span>
+          <span className="pt-node-meta">
+            {[pending ? "New" : label, p.birthYear ? `b. ${p.birthYear}` : null].filter(Boolean).join(" · ")}
+          </span>
+        </span>
+      </button>
+    );
   }
 
   return (
-    <div className="app">
-      <header className="header">
-        <h1>🌼 Family Tree — built by talking</h1>
-        <p>
-          Tell me about your family in chat. I&apos;ll propose people and
-          relationships — nothing enters the tree until you accept it.
-        </p>
-        <div className="model-note">
-          {modelNote
-            ? `Last extraction used: ${modelNote}.`
-            : "Model: Ollama (open-weight, local) when it is running — otherwise the built-in fallback parser."}{" "}
-          Your tree is saved in this browser only in this MVP.
+    <div className="pt-app">
+      <header className="pt-header">
+        <div className="pt-brand">
+          <span aria-hidden>🌼</span>
+          <h1>Family Tree</h1>
+        </div>
+        <span className="pt-pill" title="Extraction runs on your machine when Ollama is running; otherwise a rule-based parser.">
+          <span className={`pt-dot ${modelNote?.startsWith("ollama:") ? "on" : ""}`} />
+          {modelLabel(modelNote)}
+        </span>
+        <span className="pt-saved">Saved in this browser</span>
+        <div className="pt-header-actions">
+          <button className="pt-btn pt-btn-secondary" onClick={() => setShowAdd(true)}>
+            + Person
+          </button>
+        </div>
+        <div className="pt-tabs" role="tablist">
+          <button role="tab" aria-selected={mobileTab === "chat"} onClick={() => setMobileTab("chat")}>
+            Chat{proposals.length ? ` (${batches.length})` : ""}
+          </button>
+          <button role="tab" aria-selected={mobileTab === "tree"} onClick={() => setMobileTab("tree")}>
+            Tree
+          </button>
         </div>
       </header>
 
-      <div className="main">
-        <section className="chat">
-          <div className="messages">
+      <main className={`pt-main show-${mobileTab}`}>
+        <section className="pt-chat" aria-label="Chat">
+          <div className="pt-messages">
             {messages.map((m) => (
-              <div key={m.id} className={`msg ${m.role}`}>
-                {m.text}
+              <div key={m.id} className="pt-msg-group">
+                <div className={`pt-msg ${m.role} ${m.tone ?? ""}`}>{m.text}</div>
+                {m.batchId && renderBatch(m.batchId)}
               </div>
             ))}
-            {loading && <div className="msg assistant">Thinking…</div>}
+            {batches.filter((b) => !anchoredBatches.has(b)).map(renderBatch)}
+            {loading && (
+              <div className="pt-msg assistant pt-thinking">
+                <span className="pt-typing" aria-hidden>
+                  <i />
+                  <i />
+                  <i />
+                </span>
+                Reading your message… {elapsed}s
+                {elapsed >= 8 && <small>Local models can take up to a minute.</small>}
+              </div>
+            )}
+            <div ref={messagesEndRef} />
           </div>
 
-          {proposals.length > 0 && (
-            <div className="proposals">
-              <h3>Proposals — review before they enter the tree</h3>
-              {proposals.map((p) => {
-                const sameName = sameNamePerson(p, people);
-                return (
-                <div key={p.id} className="proposal">
-                  <p>{describeProposal(p, people, proposals, resolvedRefs)}</p>
-                  <small>
-                    Confidence: {p.confidence} · {p.reason}
-                  </small>
-                  {sameName && (
-                    <small>
-                      <br />
-                      ⚠ {sameName.displayName} is already in your tree. Accept adds a second person;
-                      use “Same as existing” if it is the same one.
-                    </small>
-                  )}
-                  <div className="row">
-                    <button className="btn btn-primary btn-small" onClick={() => applyProposals([p])}>
-                      Accept
-                    </button>
-                    {sameName && (
-                      <button
-                        className="btn btn-secondary btn-small"
-                        onClick={() => applyProposals([{ ...p, existingPersonId: sameName.id }])}
-                      >
-                        Same as existing {sameName.displayName}
-                      </button>
-                    )}
-                    <button
-                      className="btn btn-secondary btn-small"
-                      onClick={() => rejectProposals([p])}
-                    >
-                      Reject
-                    </button>
-                  </div>
-                </div>
-                );
-              })}
-              <div className="row">
-                <button className="btn btn-primary btn-small" onClick={() => applyProposals([...proposals])}>
-                  Accept all
+          <form className="pt-composer" onSubmit={sendChat}>
+            <div className="pt-chips">
+              {suggestions.map((s) => (
+                <button type="button" key={s} className="pt-chip" onClick={() => applySuggestion(s)}>
+                  {s === EXAMPLE ? "Try an example" : `${s.trim()}…`}
                 </button>
-                <button className="btn btn-secondary btn-small" onClick={() => setProposals([])}>
-                  Reject all
-                </button>
-              </div>
+              ))}
             </div>
-          )}
-
-          <form className="chat-form" onSubmit={sendChat}>
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="e.g. My dad is Minh, born 1960 in Hanoi…"
-            />
-            <button type="button" className="example-btn" onClick={() => setInput(EXAMPLE)}>
-              Try the example: “I&apos;m Lan. My dad is Minh, born 1960 in Hanoi. He married my mom, Hoa.”
-            </button>
-            <button className="btn btn-primary" type="submit" disabled={loading || !input.trim()}>
-              {loading ? "Working…" : "Send"}
-            </button>
+            <div className="pt-input-row">
+              <textarea
+                ref={inputRef}
+                rows={1}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    void sendChat();
+                  }
+                }}
+                placeholder={people.length ? "Tell me about someone…" : "Start with your name…"}
+                aria-label="Message"
+              />
+              {loading ? (
+                <button type="button" className="pt-btn pt-btn-secondary" onClick={() => abortRef.current?.abort()}>
+                  Stop
+                </button>
+              ) : (
+                <button className="pt-btn pt-btn-primary" type="submit" disabled={!input.trim()}>
+                  Send
+                </button>
+              )}
+            </div>
+            <small className="pt-hint">Enter to send · Shift+Enter for a new line</small>
           </form>
         </section>
 
-        <section className="tree-area">
-          <h2>Your tree</h2>
-          <p className="hint">Click a person to see details, edit their story, or add a photo.</p>
-
-          {people.length === 0 ? (
-            <div className="empty">
-              No one in the tree yet. Say hello in chat, or add someone manually below.
+        <section className="pt-tree" aria-label="Family tree">
+          {positioned.length === 0 ? (
+            <div className="pt-empty">
+              <div className="pt-empty-card">
+                <div className="pt-empty-icon" aria-hidden>
+                  🌱
+                </div>
+                <h2>Your tree starts with you</h2>
+                <p>Tell the chat who you are and who your parents are. You&apos;ll review everything before it&apos;s added.</p>
+                <div className="pt-row">
+                  <button className="pt-btn pt-btn-primary" onClick={() => applySuggestion(EXAMPLE)}>
+                    Use the example
+                  </button>
+                  <button className="pt-btn pt-btn-secondary" onClick={() => setShowAdd(true)}>
+                    Add someone by hand
+                  </button>
+                </div>
+              </div>
             </div>
           ) : (
-            <div className="tree-scroll">
-              <div className="tree-canvas" style={{ width: canvasWidth, height: canvasHeight }}>
-                <svg
-                  width={canvasWidth}
-                  height={canvasHeight}
-                  style={{ position: "absolute", top: 0, left: 0 }}
+            <div className="pt-canvas" ref={canvasRef}>
+              <div className="pt-sizer" style={{ width: width * zoom, height: height * zoom }}>
+                <div
+                  className="pt-stage"
+                  style={{ width, height, transform: `scale(${zoom})` }}
+                  onClick={(e) => e.target === e.currentTarget && setSelectedId(null)}
                 >
-                  {relationships.map((r) => {
-                    const from = posById.get(r.fromPersonId);
-                    const to = posById.get(r.toPersonId);
-                    if (!from || !to) return null;
-                    if (r.type === "PARENT_OF") {
-                      return (
-                        <line
-                          key={r.id}
-                          x1={from.x + 95}
-                          y1={from.y + 104}
-                          x2={to.x + 95}
-                          y2={to.y}
-                          stroke="#cbb89f"
-                          strokeWidth={2}
-                        />
-                      );
-                    }
-                    // Spouse / partner: dashed line between the nodes.
-                    const left = from.x <= to.x ? from : to;
-                    const right = from.x <= to.x ? to : from;
-                    return (
-                      <line
-                        key={r.id}
-                        x1={left.x + 190}
-                        y1={left.y + 52}
-                        x2={right.x}
-                        y2={right.y + 52}
-                        stroke="#e08a00"
-                        strokeWidth={2}
-                        strokeDasharray="6 4"
-                      />
-                    );
-                  })}
-                </svg>
-                {positioned.map((p) => (
-                  <button
-                    key={p.id}
-                    type="button"
-                    className={`tree-node ${selectedId === p.id ? "selected" : ""}`}
-                    style={{ left: p.x, top: p.y }}
-                    onClick={() => setSelectedId(p.id)}
-                  >
-                    {p.avatarUrl ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img className="avatar" src={p.avatarUrl} alt="" />
-                    ) : (
-                      <span className="initials">{initials(p.displayName)}</span>
-                    )}
-                    <span className="name">{p.displayName}</span>
-                    <div className="meta">
-                      {p.birthYear ? `Born ${p.birthYear}` : ""}
-                      {p.birthYear && p.birthPlace ? " · " : ""}
-                      {p.birthPlace ?? ""}
-                    </div>
-                  </button>
-                ))}
+                  <svg width={width} height={height} className="pt-lines">
+                    <g transform={`translate(${PAD},${PAD})`}>
+                      {connectors.map((c) => (
+                        <path key={c.key} d={c.d} className={`pt-line ${c.kind} ${c.pending ? "pending" : ""}`} />
+                      ))}
+                    </g>
+                  </svg>
+                  {positioned.map(renderNode)}
+                </div>
               </div>
             </div>
           )}
 
-          <div className="panels">
-            <div className="panel">
-              <h3>{selected ? `Details: ${selected.displayName}` : "Details"}</h3>
-              {!selected ? (
-                <p className="empty">Click a person in the tree.</p>
-              ) : (
-                <>
-                  <p>
-                    {selected.birthYear ? `Born ${selected.birthYear}` : "Birth year unknown"}
-                    {selected.birthPlace ? ` in ${selected.birthPlace}` : ""}
-                  </p>
-                  {selected.preferredName &&
-                    selected.preferredName !== selected.displayName && (
-                      <p>
-                        <strong>Also known as:</strong> {selected.preferredName}
-                      </p>
-                    )}
-                  <p>
-                    <strong>Parents:</strong>{" "}
-                    {parents.length > 0
-                      ? parents.map((p) => p.displayName).join(", ")
-                      : "—"}
-                  </p>
-                  <p>
-                    <strong>Spouse / partner:</strong>{" "}
-                    {spouses.length > 0
-                      ? spouses.map((p) => p.displayName).join(", ")
-                      : "—"}
-                  </p>
-                  <p>
-                    <strong>Children:</strong>{" "}
-                    {children.length > 0
-                      ? children.map((p) => p.displayName).join(", ")
-                      : "—"}
-                  </p>
-                  <p>
-                    <strong>Siblings (derived):</strong>{" "}
-                    {siblings.length > 0
-                      ? siblings.map((p) => p.displayName).join(", ")
-                      : "—"}
-                  </p>
-
-                  <label htmlFor="bio">Story / bio</label>
-                  <textarea
-                    id="bio"
-                    value={detailBio}
-                    onChange={(e) => setDetailBio(e.target.value)}
-                    placeholder="A memory, a favourite food, a story about this person…"
-                  />
-                  <div className="row">
-                    <button className="btn btn-primary btn-small" type="button" onClick={saveBio}>
-                      Save story
-                    </button>
-                  </div>
-
-                  <label htmlFor="avatar">Photo / avatar</label>
-                  <input
-                    id="avatar"
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) => uploadAvatar(e.target.files?.[0])}
-                  />
-
-                  <form onSubmit={addRelative}>
-                    <label htmlFor="relative-type">Add a relative</label>
-                    <select
-                      id="relative-type"
-                      value={relativeType}
-                      onChange={(e) => setRelativeType(e.target.value as "parent" | "spouse" | "child")}
-                    >
-                      <option value="parent">Parent</option>
-                      <option value="spouse">Spouse / partner</option>
-                      <option value="child">Child</option>
-                    </select>
-                    <label htmlFor="relative-name">Name</label>
-                    <input
-                      id="relative-name"
-                      type="text"
-                      value={relativeName}
-                      onChange={(e) => setRelativeName(e.target.value)}
-                      placeholder="e.g. Tuan"
-                    />
-                    <div className="row">
-                      <button className="btn btn-primary btn-small" type="submit">
-                        Add relative
-                      </button>
-                      <button
-                        className="btn btn-secondary btn-small"
-                        type="button"
-                        onClick={() => {
-                          if (
-                            window.confirm(
-                              `Delete ${selected.displayName} and all their relationships? This can't be undone.`
-                            )
-                          ) {
-                            deletePerson(selected.id);
-                          }
-                        }}
-                      >
-                        Delete person
-                      </button>
-                    </div>
-                  </form>
-                </>
-              )}
-            </div>
-
-            <div className="panel">
-              <h3>Add a person manually</h3>
-              <p>Useful when chat gets something wrong — you can always fix the tree by hand.</p>
-              <form onSubmit={manualAdd}>
-                <label htmlFor="manual-name">Name</label>
-                <input
-                  id="manual-name"
-                  type="text"
-                  value={manualName}
-                  onChange={(e) => setManualName(e.target.value)}
-                  placeholder="e.g. Nguyen Van Minh"
-                />
-                <label htmlFor="manual-year">Birth year (optional)</label>
-                <input
-                  id="manual-year"
-                  type="number"
-                  value={manualYear}
-                  onChange={(e) => setManualYear(e.target.value)}
-                  placeholder="1960"
-                />
-                <label htmlFor="manual-place">Birthplace (optional)</label>
-                <input
-                  id="manual-place"
-                  type="text"
-                  value={manualPlace}
-                  onChange={(e) => setManualPlace(e.target.value)}
-                  placeholder="Hanoi"
-                />
-                <div className="row">
-                  <button className="btn btn-primary btn-small" type="submit">
-                    Add person
+          {positioned.length > 0 && (
+            <>
+              <div className="pt-zoom" role="group" aria-label="Zoom">
+                <button onClick={() => setZoom((z) => Math.max(0.4, +(z - 0.1).toFixed(2)))} aria-label="Zoom out">
+                  −
+                </button>
+                <button onClick={() => setZoom(1)} title="Reset to 100%">
+                  {Math.round(zoom * 100)}%
+                </button>
+                <button onClick={() => setZoom((z) => Math.min(1.6, +(z + 0.1).toFixed(2)))} aria-label="Zoom in">
+                  +
+                </button>
+                <button onClick={fit}>Fit</button>
+                {hasManualLayout && (
+                  <button onClick={resetLayout} title="Put everyone back in the automatic layout">
+                    Tidy up
                   </button>
-                </div>
-              </form>
-              <p style={{ color: "var(--muted)", fontSize: 13 }}>
-                Tip: after adding someone manually, click them in the tree and use
-                “Add a relative” to link parents, spouses, and children.
-              </p>
-            </div>
-          </div>
+                )}
+              </div>
+              <div className="pt-legend">
+                <span><i className="lg parent" /> Parent → child</span>
+                <span><i className="lg spouse" /> Partners</span>
+                {preview.pendingIds.size > 0 && (
+                  <span><i className="lg pending" /> Waiting for review</span>
+                )}
+                <span>Drag cards to rearrange</span>
+              </div>
+            </>
+          )}
+
+          {selected && (
+            <PersonDrawer
+              key={selected.id}
+              person={selected}
+              people={people}
+              relationships={relationships}
+              isEgo={selected.id === egoId}
+              relation={relationLabel(egoId, selected.id, people, relationships)}
+              quickAdd={quickAdd}
+              setQuickAdd={setQuickAdd}
+              onClose={() => setSelectedId(null)}
+              onPatch={(patch) => patchPerson(selected.id, patch)}
+              onAvatar={(f) => uploadAvatar(selected.id, f)}
+              onSelect={selectAndReveal}
+              onAddRelative={(kind, name, coParentId) =>
+                addRelative(selected.id, kind, { displayName: name }, coParentId)
+              }
+              onSetEgo={() => setEgoId(selected.id)}
+              onDelete={() => deletePerson(selected.id)}
+            />
+          )}
         </section>
+      </main>
+
+      {showAdd && (
+        <AddPersonDialog
+          people={people}
+          defaultAnchor={selectedId}
+          onClose={() => setShowAdd(false)}
+          onAdd={(fields, anchorId, kind) => {
+            const id = addRelative(anchorId, kind, fields);
+            setShowAdd(false);
+            selectAndReveal(id);
+          }}
+        />
+      )}
+
+      {toast && (
+        <div className="pt-toast" role="status">
+          {toast.label}
+          {toast.onUndo && (
+            <button className="pt-toast-undo" onClick={undo}>
+              Undo
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PersonDrawer(props: {
+  person: Person;
+  people: Person[];
+  relationships: Relationship[];
+  isEgo: boolean;
+  relation: string | null;
+  quickAdd: QuickAdd | null;
+  setQuickAdd: (q: QuickAdd | null) => void;
+  onClose: () => void;
+  onPatch: (patch: Partial<Person>) => void;
+  onAvatar: (file: File | undefined) => void;
+  onSelect: (id: string) => void;
+  onAddRelative: (kind: RelativeKind, name: string, coParentId: string | null) => void;
+  onSetEgo: () => void;
+  onDelete: () => void;
+}) {
+  const { person, people, relationships, quickAdd, setQuickAdd } = props;
+  const groups: { kind: RelativeKind; title: string; list: Person[] }[] = [
+    { kind: "parent", title: "Parents", list: getParents(person.id, people, relationships) },
+    { kind: "partner", title: "Partners", list: getSpouses(person.id, people, relationships) },
+    { kind: "child", title: "Children", list: getChildren(person.id, people, relationships) },
+    { kind: "sibling", title: "Siblings", list: getSiblings(person.id, people, relationships) },
+  ];
+  const partners = groups[1].list;
+  const soloPartner = partners.length === 1 ? partners[0] : null;
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  function submitQuickAdd(e: React.FormEvent) {
+    e.preventDefault();
+    if (!quickAdd?.name.trim()) return;
+    props.onAddRelative(
+      quickAdd.kind,
+      quickAdd.name.trim(),
+      quickAdd.kind === "child" && quickAdd.withPartner && soloPartner ? soloPartner.id : null
+    );
+    setQuickAdd({ ...quickAdd, name: "" });
+  }
+
+  return (
+    <aside className="pt-drawer" aria-label={`Details for ${person.displayName}`}>
+      <div className="pt-drawer-head">
+        <label className="pt-drawer-avatar" title="Change photo">
+          {person.avatarUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={person.avatarUrl} alt="" />
+          ) : (
+            <span>{initials(person.displayName)}</span>
+          )}
+          <span className="pt-drawer-avatar-edit">Photo</span>
+          <input type="file" accept="image/*" hidden onChange={(e) => props.onAvatar(e.target.files?.[0])} />
+        </label>
+        <div>
+          <h2>{person.displayName}</h2>
+          {props.relation && <span className="pt-tag">{props.relation}</span>}
+        </div>
+        <button className="pt-icon-btn" onClick={props.onClose} aria-label="Close details">
+          ×
+        </button>
       </div>
 
-      <footer className="footer-note">
-        MVP note: the tree lives in this browser&apos;s localStorage. For a shared
-        or deployed version, swap that for a database (see README). When Ollama is
-        running locally, extraction uses your open-weight model; otherwise the
-        deterministic fallback parser runs so the demo still works.
-      </footer>
+      <div className="pt-drawer-body">
+        <div className="pt-fields">
+          <label className="wide">
+            Full name
+            <input value={person.displayName} onChange={(e) => props.onPatch({ displayName: e.target.value })} />
+          </label>
+          <label className="wide">
+            Also known as
+            <input
+              value={person.preferredName ?? ""}
+              placeholder="Nickname"
+              onChange={(e) => props.onPatch({ preferredName: e.target.value || null })}
+            />
+          </label>
+          <label>
+            Birth year
+            <input
+              inputMode="numeric"
+              value={person.birthYear ?? ""}
+              placeholder="1960"
+              onChange={(e) => {
+                const v = e.target.value.replace(/\D/g, "").slice(0, 4);
+                props.onPatch({ birthYear: v ? Number(v) : null });
+              }}
+            />
+          </label>
+          <label>
+            Gender
+            <select
+              value={person.gender ?? ""}
+              onChange={(e) => props.onPatch({ gender: (e.target.value || null) as Gender | null })}
+            >
+              <option value="">Not set</option>
+              <option value="female">Female</option>
+              <option value="male">Male</option>
+            </select>
+          </label>
+          <label className="wide">
+            Birthplace
+            <input
+              value={person.birthPlace ?? ""}
+              placeholder="Hanoi"
+              onChange={(e) => props.onPatch({ birthPlace: e.target.value || null })}
+            />
+          </label>
+          <label className="wide">
+            Story
+            <textarea
+              value={person.bio ?? ""}
+              placeholder="A memory, a favourite dish, a saying they had…"
+              onChange={(e) => props.onPatch({ bio: e.target.value || null })}
+            />
+          </label>
+        </div>
+        <small className="pt-hint">Changes save automatically.</small>
+
+        <h3>Family</h3>
+        {groups.map((g) => (
+          <div key={g.kind} className="pt-family-group">
+            <div className="pt-family-head">
+              <span>{g.title}</span>
+              <button
+                className="pt-link"
+                onClick={() => setQuickAdd({ kind: g.kind, name: "", withPartner: true })}
+              >
+                + Add
+              </button>
+            </div>
+            <div className="pt-chips">
+              {g.list.length === 0 && <span className="pt-none">None yet</span>}
+              {g.list.map((r) => (
+                <button key={r.id} className="pt-chip person" onClick={() => props.onSelect(r.id)}>
+                  {r.displayName}
+                </button>
+              ))}
+            </div>
+            {quickAdd?.kind === g.kind && (
+              <form className="pt-quick-add" onSubmit={submitQuickAdd}>
+                <input
+                  autoFocus
+                  value={quickAdd.name}
+                  placeholder={`${KIND_LABEL[g.kind]}'s name`}
+                  onChange={(e) => setQuickAdd({ ...quickAdd, name: e.target.value })}
+                />
+                <button className="pt-btn pt-btn-primary pt-btn-small" disabled={!quickAdd.name.trim()}>
+                  Add
+                </button>
+                {g.kind === "child" && soloPartner && (
+                  <label className="pt-check">
+                    <input
+                      type="checkbox"
+                      checked={quickAdd.withPartner}
+                      onChange={(e) => setQuickAdd({ ...quickAdd, withPartner: e.target.checked })}
+                    />
+                    Also {soloPartner.displayName}&apos;s child
+                  </label>
+                )}
+              </form>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div className="pt-drawer-foot">
+        {!props.isEgo && (
+          <button className="pt-btn pt-btn-ghost" onClick={props.onSetEgo} title="Relationship labels are shown relative to this person">
+            This is me
+          </button>
+        )}
+        {confirmDelete ? (
+          <span className="pt-confirm">
+            Delete and unlink?
+            <button className="pt-btn pt-btn-danger pt-btn-small" onClick={props.onDelete}>
+              Delete
+            </button>
+            <button className="pt-btn pt-btn-ghost pt-btn-small" onClick={() => setConfirmDelete(false)}>
+              Cancel
+            </button>
+          </span>
+        ) : (
+          <button className="pt-btn pt-btn-ghost danger" onClick={() => setConfirmDelete(true)}>
+            Delete person
+          </button>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function AddPersonDialog(props: {
+  people: Person[];
+  defaultAnchor: string | null;
+  onClose: () => void;
+  onAdd: (
+    fields: Pick<Person, "displayName" | "birthYear" | "birthPlace">,
+    anchorId: string | null,
+    kind: RelativeKind
+  ) => void;
+}) {
+  const [name, setName] = useState("");
+  const [year, setYear] = useState("");
+  const [place, setPlace] = useState("");
+  const [anchor, setAnchor] = useState(props.defaultAnchor ?? "");
+  const [kind, setKind] = useState<RelativeKind>("parent");
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    props.onAdd(
+      { displayName: name.trim(), birthYear: year ? Number(year) : null, birthPlace: place.trim() || null },
+      anchor || null,
+      kind
+    );
+  }
+
+  return (
+    <div className="pt-overlay" onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}>
+      <form className="pt-dialog" onSubmit={submit} role="dialog" aria-label="Add a person">
+        <h2>Add a person</h2>
+        <div className="pt-fields">
+          <label className="wide">
+            Full name
+            <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Nguyen Van Minh" />
+          </label>
+          <label>
+            Birth year
+            <input
+              inputMode="numeric"
+              value={year}
+              onChange={(e) => setYear(e.target.value.replace(/\D/g, "").slice(0, 4))}
+              placeholder="Optional"
+            />
+          </label>
+          <label>
+            Birthplace
+            <input value={place} onChange={(e) => setPlace(e.target.value)} placeholder="Optional" />
+          </label>
+          {props.people.length > 0 && (
+            <>
+              <label>
+                Related to
+                <select value={anchor} onChange={(e) => setAnchor(e.target.value)}>
+                  <option value="">Nobody yet</option>
+                  {props.people.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.displayName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                As their
+                <select value={kind} disabled={!anchor} onChange={(e) => setKind(e.target.value as RelativeKind)}>
+                  {(Object.keys(KIND_LABEL) as RelativeKind[]).map((k) => (
+                    <option key={k} value={k}>
+                      {KIND_LABEL[k].toLowerCase()}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </>
+          )}
+        </div>
+        <div className="pt-row end">
+          <button type="button" className="pt-btn pt-btn-ghost" onClick={props.onClose}>
+            Cancel
+          </button>
+          <button className="pt-btn pt-btn-primary" disabled={!name.trim()}>
+            Add to tree
+          </button>
+        </div>
+      </form>
     </div>
   );
 }

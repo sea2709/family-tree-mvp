@@ -68,26 +68,33 @@ The chat header shows which path was used for the last message
 2. **Extraction** — `/api/chat` sends only the new message plus a
    compact roster of existing people to Ollama (or the fallback
    parser). It returns a friendly reply plus structured proposals.
-3. **Confirmation** — proposals appear as cards. Nothing enters the
-   tree until the user presses Accept. This is deliberate: it stops
-   the model merging two people with the same name or inventing dates.
+3. **Confirmation** — each reply comes with a checklist, and the
+   checked items show up in the tree as dashed preview cards. Nothing
+   enters the tree until the user presses "Add to tree" (with Undo).
+   This is deliberate: it stops the model merging two people with the
+   same name or inventing dates.
 4. **Tree** — `lib/tree.ts` derives parents, children, spouses, and
    siblings from just two stored edge types (`PARENT_OF`,
-   `SPOUSE_OF`/`PARTNER_OF`). Clicking a node opens details, a story
-   editor, avatar upload, and add-parent/spouse/child shortcuts.
+   `SPOUSE_OF`/`PARTNER_OF`), labels everyone relative to the speaker
+   ("Mother", "Sister-in-law"), and draws parent/child links as family
+   bars. Cards can be dragged (positions are saved; "Tidy up" resets
+   them), and the canvas zooms and fits. Clicking a card opens a side
+   panel to edit details, the story, the photo, and to add relatives.
 
 Try it with:
 
 > I'm Lan. My dad is Minh, born 1960 in Hanoi. He married my mom, Hoa.
 
-Accept the proposals and the tree renders Lan with Minh and Hoa as
+Press "Add all to tree" and the tree renders Lan with Minh and Hoa as
 parents, linked as spouses.
 
 ## What is in this MVP — and what is deliberately not
 
-In: chat extraction, proposal confirmation, interactive tree,
-person details, bio/story editing, avatar upload (stored as a data
-URL), manual add/edit/delete, localStorage persistence.
+In: chat extraction, proposal review with tree preview and undo,
+draggable/zoomable tree, relationship labels, person details,
+bio/story editing, avatar upload (resized, stored as a data URL),
+manual add/edit/delete, localStorage persistence (tree, chat
+history, and card positions).
 
 Out (for later): user accounts and sharing, a real database,
 React Flow, GEDCOM import/export, voice recording, AI avatar
@@ -99,9 +106,9 @@ generation, automatic duplicate merging, timeline view.
   with Prisma + Postgres (a `Person` table and a `Relationship`
   table, as sketched in the data-model note). The `Person` /
   `Relationship` types in `lib/types.ts` already match that shape.
-- **Tree rendering:** swap the simple generation layout in
-  `lib/tree.ts` for React Flow when you need dragging, zooming,
-  and richer node cards.
+- **Tree rendering:** the hand-rolled layout in `lib/tree.ts` plus
+  drag/zoom in `app/page.tsx` is enough for one family; swap to React
+  Flow for panning, minimaps, or very large trees.
 - **Extraction:** keep the proposal shape, but add more tool calls
   (update person, add story, ask clarification) and a proper agent
   framework such as Mastra or LangGraph for multi-turn memory.

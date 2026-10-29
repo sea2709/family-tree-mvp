@@ -80,80 +80,46 @@ export function getSiblings(
 
 export type PositionedPerson = Person & { x: number; y: number; generation: number };
 
-// Simple generation layout: roots (no parents) at the top, children
-// one row below, spouses on the same row as their partner.
+// Generation layout. Generations are relative: walking any edge from a
+// person fixes the other side (parent -1, child +1, spouse/sibling 0),
+// so someone who married in sits beside their partner instead of in
+// the top row just because they have no parents in the tree.
 export function layoutTree(people: Person[], rels: Relationship[]): PositionedPerson[] {
-  const generation = new Map<string, number>();
-  const queue: string[] = [];
+  const ids = new Set(people.map((p) => p.id));
+  const neighbours = new Map<string, { id: string; delta: number }[]>();
+  const link = (a: string, b: string, delta: number) => {
+    neighbours.set(a, [...(neighbours.get(a) ?? []), { id: b, delta }]);
+    neighbours.set(b, [...(neighbours.get(b) ?? []), { id: a, delta: -delta }]);
+  };
+  for (const r of rels) {
+    if (!ids.has(r.fromPersonId) || !ids.has(r.toPersonId)) continue;
+    link(r.fromPersonId, r.toPersonId, r.type === "PARENT_OF" ? 1 : 0);
+  }
 
+  const generation = new Map<string, number>();
+  const discovery: string[] = [];
   for (const p of people) {
-    if (getParents(p.id, people, rels).length === 0) {
-      generation.set(p.id, 0);
-      queue.push(p.id);
-    }
-  }
-  // Spouses of roots share the root generation before children are placed.
-  for (const r of rels) {
-    if (r.type === "SPOUSE_OF" || r.type === "PARTNER_OF") {
-      const a = generation.get(r.fromPersonId);
-      const b = generation.get(r.toPersonId);
-      if (a !== undefined && b === undefined) {
-        generation.set(r.toPersonId, a);
-        queue.push(r.toPersonId);
-      } else if (b !== undefined && a === undefined) {
-        generation.set(r.fromPersonId, b);
-        queue.push(r.fromPersonId);
+    if (generation.has(p.id)) continue;
+    const component = [p.id];
+    generation.set(p.id, 0);
+    for (let i = 0; i < component.length; i++) {
+      const id = component[i];
+      for (const n of neighbours.get(id) ?? []) {
+        if (generation.has(n.id)) continue;
+        generation.set(n.id, generation.get(id)! + n.delta);
+        component.push(n.id);
       }
     }
-  }
-  // Explicit siblings share a generation too (e.g. a dad's brother
-  // linked with SIBLING_OF when the grandparents are unknown).
-  for (const r of rels) {
-    if (r.type === "SIBLING_OF") {
-      const a = generation.get(r.fromPersonId);
-      const b = generation.get(r.toPersonId);
-      if (a !== undefined && b === undefined) {
-        generation.set(r.toPersonId, a);
-        queue.push(r.toPersonId);
-      } else if (b !== undefined && a === undefined) {
-        generation.set(r.fromPersonId, b);
-        queue.push(r.fromPersonId);
-      }
-    }
-  }
-  while (queue.length > 0) {
-    const id = queue.shift()!;
-    const gen = generation.get(id) ?? 0;
-    for (const child of getChildren(id, people, rels)) {
-      if (!generation.has(child.id)) {
-        generation.set(child.id, gen + 1);
-        queue.push(child.id);
-      }
-    }
-    for (const spouse of getSpouses(id, people, rels)) {
-      if (!generation.has(spouse.id)) {
-        generation.set(spouse.id, gen);
-        queue.push(spouse.id);
-      }
-    }
-    for (const sibling of getSiblings(id, people, rels)) {
-      if (!generation.has(sibling.id)) {
-        generation.set(sibling.id, gen);
-        queue.push(sibling.id);
-      }
-    }
-  }
-  // Anything unreachable (e.g. a disconnected person) goes at the top.
-  for (const p of people) {
-    if (!generation.has(p.id)) generation.set(p.id, 0);
+    // Each family's oldest generation starts at row 0.
+    const min = Math.min(...component.map((id) => generation.get(id)!));
+    for (const id of component) generation.set(id, generation.get(id)! - min);
+    discovery.push(...component);
   }
 
   const byGen = new Map<number, Person[]>();
   for (const p of people) {
     const gen = generation.get(p.id) ?? 0;
-    const list = byGen.get(gen) ?? [];
-    list.push(p);
-    byGen.set(gen, list);
+    byGen.set(gen, [...(byGen.get(gen) ?? []), p]);
   }
 
   const NODE_W = 190;
@@ -161,8 +127,36 @@ export function layoutTree(people: Person[], rels: Relationship[]): PositionedPe
   const H_GAP = 28;
   const V_GAP = 72;
   const out: PositionedPerson[] = [];
+  const column = new Map<string, number>();
+  const order = new Map(discovery.map((id, i) => [id, i]));
   for (const [gen, list] of [...byGen.entries()].sort((a, b) => a[0] - b[0])) {
-    list.forEach((p, i) => {
+    // Children follow their parents' left-to-right order; people
+    // without parents in the tree keep discovery order.
+    const parentKey = (p: Person): number | null => {
+      const cols = getParents(p.id, people, rels)
+        .map((x) => column.get(x.id))
+        .filter((c): c is number => c !== undefined);
+      return cols.length > 0 ? cols.reduce((a, b) => a + b, 0) / cols.length : null;
+    };
+    // Someone who married in sorts with their partner.
+    const key = (p: Person) =>
+      parentKey(p) ??
+      getSpouses(p.id, people, rels)
+        .map(parentKey)
+        .find((k): k is number => k !== null) ??
+      (order.get(p.id) ?? 0) / Math.max(discovery.length, 1);
+    const sorted = [...list].sort((a, b) => key(a) - key(b));
+    // Keep partners side by side so the spouse line doesn't cross nodes.
+    const row: Person[] = [];
+    for (const p of sorted) {
+      if (row.includes(p)) continue;
+      row.push(p);
+      for (const s of getSpouses(p.id, people, rels)) {
+        if (!row.includes(s) && list.includes(s)) row.push(s);
+      }
+    }
+    row.forEach((p, i) => {
+      column.set(p.id, i);
       out.push({
         ...p,
         generation: gen,

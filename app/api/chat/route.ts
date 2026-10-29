@@ -12,6 +12,7 @@ const SYSTEM_PROMPT = `You extract family-tree facts from ONE chat message. You 
 Rules:
 - Only extract what is EXPLICITLY stated in this message. Never invent a date, place, spelling, or relationship.
 - If a value is vague ("around 1960", "in the 60s"), keep the year and set the proposal confidence to "low". Do not make it exact.
+- Relative ages ARE stated facts, not guesses: "he is 2 years younger than me" / "younger than me 2 years" / "I am 3 years older than Thuc". When one side's birth year is given (in this message or in the roster), compute the other side's birth year and emit a person update for them too (the speaker included — use the speaker's roster id as tempId). E.g. Thuc born 1990 and "he is younger than me 2 years" means the speaker was born in 1988. Set that proposal's confidence to "medium" and put the arithmetic in "reason", e.g. "Worked out from: Thuc born 1990, 2 years younger than you".
 - Never merge two people with the same name. If a name could be an existing person from the roster or a new person, prefer the existing roster id ONLY on an exact case-insensitive name match; otherwise use a new tempId and set confidence to "low".
 - Resolve relative words ONLY if unambiguous: "my dad" = parent of the speaker, "my mom" = parent of the speaker. "My uncle", "my aunt", "my cousin" are AMBIGUOUS — do not guess a link; return a person proposal at most, and ask in the reply which side of the family they are on.
 - Use the "Known relationships" and each roster person's relation to the speaker to resolve references to people already in the tree. E.g. if Thuc is listed as "speaker's sibling", "my brother Thuc" or "my only sibling" means that existing id — do not ask who the parents are when they are already known, and never re-propose a relationship that is already listed. "My dad"/"my mom" refers to one of the speaker's existing parents; pick by name if the message makes it clear, otherwise ask which one.
@@ -28,10 +29,12 @@ Rules:
 {
   "reply": "a short friendly summary of what you think you heard, and what to confirm",
   "proposals": [
+    { "id": "p0", "kind": "person", "tempId": "temp-lan", "displayName": "Lan", "isSpeaker": true, "reason": "You said: \\"I'm Lan\\"", "confidence": "high" },
     { "id": "p1", "kind": "person", "tempId": "temp-minh", "displayName": "Minh", "birthYear": 1960, "birthPlace": "Hanoi", "reason": "You said: \\"...\\"", "confidence": "high" },
     { "id": "p2", "kind": "relationship", "fromRef": "temp-minh", "toRef": "<existing person id or tempId>", "relationshipType": "PARENT_OF", "reason": "You said: \\"...\\"", "confidence": "high" }
   ]
 }
+- Set "isSpeaker": true only on the person proposal for the speaker themself ("I'm Lan", "My name is Dang"), and only when no speaker id is set yet.
 - kind is only "person" or "relationship". relationshipType is only "PARENT_OF" (from = parent, to = child), "SPOUSE_OF", "PARTNER_OF", or "SIBLING_OF" (symmetric, store once). fromRef/toRef must be an existing roster id or a tempId from a person proposal in the same response. Grandparents, aunts/uncles and cousins are derived from parent/spouse/sibling edges, never emitted as their own edge types.
 - If nothing clear can be extracted, return an empty proposals array and a reply asking for one fact, e.g. "My dad is Minh, born 1960 in Hanoi".`;
 
@@ -73,7 +76,11 @@ function nsToMs(ns: unknown): string {
   return typeof ns === "number" ? `${Math.round(ns / 1e6)}ms` : "?";
 }
 
-function normalizeProposals(raw: unknown, roster: RosterPerson[]): Proposal[] {
+function normalizeProposals(
+  raw: unknown,
+  roster: RosterPerson[],
+  egoId: string | null
+): Proposal[] {
   if (!Array.isArray(raw)) return [];
   const out: Proposal[] = [];
   raw.forEach((item, i) => {
@@ -84,7 +91,12 @@ function normalizeProposals(raw: unknown, roster: RosterPerson[]): Proposal[] {
       p.confidence === "high" || p.confidence === "medium" || p.confidence === "low"
         ? p.confidence
         : "medium";
-    const tempId = typeof p.tempId === "string" ? p.tempId : undefined;
+    const tempId =
+      typeof p.tempId === "string" && p.tempId
+        ? p.tempId
+        : p.kind === "person"
+          ? `temp-${i}`
+          : undefined;
     // Updates to an existing person often carry only the changed fields.
     const rosterName = tempId ? roster.find((r) => r.id === tempId)?.displayName : undefined;
     out.push({
@@ -107,9 +119,39 @@ function normalizeProposals(raw: unknown, roster: RosterPerson[]): Proposal[] {
           : undefined,
       reason: typeof p.reason === "string" ? p.reason : "From your message",
       confidence,
+      isSpeaker: p.kind === "person" && p.isSpeaker === true && !egoId,
     });
   });
-  return out;
+
+  // Models often omit the flag. Without it the page cannot tell the
+  // speaker's card from their dad's, so fall back to the person whose
+  // quote is "I'm X" / "My name is X", else the first new person.
+  if (!egoId && !out.some((p) => p.isSpeaker)) {
+    const newPeople = out.filter(
+      (p) => p.kind === "person" && !roster.some((r) => r.id === p.tempId)
+    );
+    const speaker =
+      newPeople.find((p) => /\b(i am|i'm|my name is)\b/i.test(p.reason)) ?? newPeople[0];
+    if (speaker) speaker.isSpeaker = true;
+  }
+
+  // A relationship whose side is neither a roster id nor a tempId in
+  // this batch can never be applied; drop it instead of showing a
+  // card that silently does nothing.
+  const known = new Set([
+    ...roster.map((r) => r.id),
+    ...out.filter((p) => p.kind === "person").map((p) => p.tempId as string),
+  ]);
+  return out.filter(
+    (p) =>
+      p.kind === "person" ||
+      (p.relationshipType &&
+        p.fromRef &&
+        p.toRef &&
+        p.fromRef !== p.toRef &&
+        known.has(p.fromRef) &&
+        known.has(p.toRef))
+  );
 }
 
 function normalizeRelationships(raw: unknown, roster: RosterPerson[]): RosterRelationship[] {
@@ -225,8 +267,11 @@ async function tryOllama(
 ): Promise<{ reply: string; proposals: Proposal[]; modelUsed: string } | null> {
   const host = process.env.OLLAMA_HOST || "http://localhost:11434";
   const model = process.env.OLLAMA_MODEL || "gemma4:12b";
+  // Large local models (e.g. gemma4:31b) can need well over 90s for a
+  // multi-fact message, so the limit is configurable.
+  const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS) || 90_000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90_000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const started = Date.now();
   try {
     const userPrompt = buildUserPrompt(message, roster, rels, egoId, history);
@@ -278,7 +323,7 @@ async function tryOllama(
       return null;
     }
     const rawCount = Array.isArray(parsed.proposals) ? parsed.proposals.length : 0;
-    const proposals = normalizeProposals(parsed.proposals, roster);
+    const proposals = normalizeProposals(parsed.proposals, roster, egoId);
     log(`ollama proposals: ${proposals.length} kept of ${rawCount} returned`);
     const reply =
       typeof parsed.reply === "string" && parsed.reply.trim()

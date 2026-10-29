@@ -30,10 +30,33 @@ function initials(name: string): string {
     .join("");
 }
 
+// Models reuse ids like "p1" / "temp-minh" every turn, so cards left
+// pending from an earlier turn would collide with the new batch.
+// Existing person ids are left alone.
+function scopeBatch(batch: Proposal[], people: Person[]): Proposal[] {
+  const prefix = uid().slice(0, 8);
+  const existing = new Set(people.map((p) => p.id));
+  const rename = new Map<string, string>();
+  for (const p of batch) {
+    if (p.kind === "person" && p.tempId && !existing.has(p.tempId)) {
+      rename.set(p.tempId, `${prefix}:${p.tempId}`);
+    }
+  }
+  const scoped = (ref?: string) => (ref ? rename.get(ref) ?? ref : ref);
+  return batch.map((p) => ({
+    ...p,
+    id: `${prefix}:${p.id}`,
+    tempId: scoped(p.tempId),
+    fromRef: scoped(p.fromRef),
+    toRef: scoped(p.toRef),
+  }));
+}
+
 function describeProposal(
   p: Proposal,
   people: Person[],
-  proposals: Proposal[]
+  proposals: Proposal[],
+  resolved: Record<string, string>
 ): string {
   if (p.kind === "person") {
     const existing = p.tempId ? people.find((x) => x.id === p.tempId) : undefined;
@@ -50,7 +73,7 @@ function describeProposal(
   }
   const nameFor = (ref?: string): string => {
     if (!ref) return "someone";
-    const existing = people.find((x) => x.id === ref);
+    const existing = people.find((x) => x.id === (resolved[ref] ?? ref));
     if (existing) return existing.displayName;
     const pending = proposals.find((x) => x.kind === "person" && x.tempId === ref);
     return pending?.displayName ?? "someone";
@@ -75,6 +98,9 @@ export default function Home() {
     },
   ]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
+  // tempId -> person id for person proposals already accepted, so a
+  // relationship card accepted later still knows who it points at.
+  const [resolvedRefs, setResolvedRefs] = useState<Record<string, string>>({});
   // The speaker, set once from the first chat batch and then kept
   // stable. Previously egoId was people[0], which changed if the
   // user accepted proposals in a different order — so a second
@@ -188,7 +214,7 @@ export default function Home() {
         },
       ]);
       if (Array.isArray(data.proposals)) {
-        setProposals((prev) => [...prev, ...(data.proposals as Proposal[])]);
+        setProposals((prev) => [...prev, ...scopeBatch(data.proposals as Proposal[], people)]);
       }
       if (typeof data.modelUsed === "string") setModelNote(data.modelUsed);
     } catch {
@@ -212,99 +238,71 @@ export default function Home() {
     let nextPeople = [...people];
     let nextRels = [...relationships];
     let nextProps = [...proposals];
+    const nextResolved = { ...resolvedRefs };
+    let nextEgo = egoId;
     let lastCreatedId: string | null = null;
-    let firstCreatedId: string | null = null;
+
+    // Accepts one person proposal: an update when its tempId is an
+    // existing id, a reuse on an exact name match, otherwise a new
+    // person. Either way the tempId is remembered for later cards.
+    const acceptPerson = (p: Proposal): string | null => {
+      nextProps = nextProps.filter((x) => x !== p);
+      let id: string | null = null;
+      const target = p.tempId ? nextPeople.find((x) => x.id === p.tempId) : undefined;
+      const byName = p.displayName
+        ? nextPeople.find((x) => x.displayName.toLowerCase() === p.displayName!.toLowerCase())
+        : undefined;
+      if (target) {
+        const displayName = p.displayName ?? target.displayName;
+        const updated: Person = {
+          ...target,
+          displayName,
+          preferredName:
+            p.preferredName ??
+            (target.preferredName || (target.displayName !== displayName ? target.displayName : null)),
+          birthYear: p.birthYear ?? target.birthYear ?? null,
+          birthPlace: p.birthPlace ?? target.birthPlace ?? null,
+          bio: p.bio ?? target.bio ?? null,
+        };
+        nextPeople = nextPeople.map((x) => (x.id === target.id ? updated : x));
+        id = target.id;
+      } else if (byName) {
+        id = byName.id;
+      } else if (p.displayName) {
+        const created: Person = {
+          id: uid(),
+          displayName: p.displayName,
+          preferredName: p.preferredName ?? null,
+          birthYear: p.birthYear ?? null,
+          birthPlace: p.birthPlace ?? null,
+          bio: p.bio ?? null,
+        };
+        nextPeople = [...nextPeople, created];
+        lastCreatedId = created.id;
+        id = created.id;
+      }
+      if (id && p.tempId) nextResolved[p.tempId] = id;
+      // Only the speaker's own card sets the ego, and only once, so
+      // accepting "Minh" before "Lan" does not make Minh the speaker.
+      if (id && p.isSpeaker && !nextEgo) nextEgo = id;
+      return id;
+    };
 
     const ensurePerson = (ref?: string): string | null => {
       if (!ref) return null;
-      const existing = nextPeople.find((x) => x.id === ref);
-      if (existing) return existing.id;
+      const mapped = nextResolved[ref] ?? ref;
+      if (nextPeople.some((x) => x.id === mapped)) return mapped;
       const pending = nextProps.find((x) => x.kind === "person" && x.tempId === ref);
-      if (pending) {
-        const created: Person = {
-          id: uid(),
-          displayName: pending.displayName ?? "Unnamed person",
-          preferredName: pending.preferredName ?? null,
-          birthYear: pending.birthYear ?? null,
-          birthPlace: pending.birthPlace ?? null,
-          bio: pending.bio ?? null,
-        };
-        nextPeople = [...nextPeople, created];
-        nextProps = nextProps.filter((x) => x !== pending);
-        lastCreatedId = created.id;
-        if (!firstCreatedId) firstCreatedId = created.id;
-        return created.id;
-      }
-      return null;
+      return pending ? acceptPerson(pending) : null;
     };
 
     for (const p of toApply) {
+      if (!nextProps.includes(p)) continue;
       if (p.kind === "person") {
-        const target = p.tempId ? nextPeople.find((x) => x.id === p.tempId) : undefined;
-        if (target) {
-          const displayName = p.displayName ?? target.displayName;
-          const updated: Person = {
-            ...target,
-            displayName,
-            preferredName:
-              p.preferredName ??
-              (target.preferredName || (target.displayName !== displayName ? target.displayName : null)),
-            birthYear: p.birthYear ?? target.birthYear ?? null,
-            birthPlace: p.birthPlace ?? target.birthPlace ?? null,
-            bio: p.bio ?? target.bio ?? null,
-          };
-          nextPeople = nextPeople.map((x) => (x.id === target.id ? updated : x));
-          nextProps = nextProps.filter((x) => x !== p);
-          continue;
-        }
-        if (!p.displayName) continue;
-        const byName = nextPeople.find(
-          (x) => x.displayName.toLowerCase() === p.displayName!.toLowerCase()
-        );
-        if (byName) {
-          if (p.tempId) {
-            // Point any relationship proposals at the existing person
-            // by treating the tempId as resolved in ensurePerson's
-            // fallback below — handled by the name check on accept
-            // of the relationship via nextProps removal only.
-          }
-        } else {
-          const created: Person = {
-            id: uid(),
-            displayName: p.displayName,
-            preferredName: p.preferredName ?? null,
-            birthYear: p.birthYear ?? null,
-            birthPlace: p.birthPlace ?? null,
-            bio: p.bio ?? null,
-          };
-          nextPeople = [...nextPeople, created];
-          lastCreatedId = created.id;
-          if (!firstCreatedId) firstCreatedId = created.id;
-        }
-        nextProps = nextProps.filter((x) => x !== p);
+        acceptPerson(p);
       } else if (p.kind === "relationship") {
-        // If a side refers to a tempId whose person proposal was
-        // already name-matched to an existing person, resolve by name.
-        let fromId = ensurePerson(p.fromRef);
-        let toId = ensurePerson(p.toRef);
-        if (!fromId && p.fromRef) {
-          const pending = proposals.find((x) => x.kind === "person" && x.tempId === p.fromRef);
-          if (pending?.displayName) {
-            const byName = nextPeople.find(
-              (x) => x.displayName.toLowerCase() === pending.displayName!.toLowerCase()
-            );
-            fromId = byName?.id ?? null;
-          }
-        }
-        if (!toId && p.toRef) {
-          const pending = proposals.find((x) => x.kind === "person" && x.tempId === p.toRef);
-          if (pending?.displayName) {
-            const byName = nextPeople.find(
-              (x) => x.displayName.toLowerCase() === pending.displayName!.toLowerCase()
-            );
-            toId = byName?.id ?? null;
-          }
-        }
+        const fromId = ensurePerson(p.fromRef);
+        const toId = ensurePerson(p.toRef);
         if (fromId && toId && fromId !== toId) {
           const duplicate = nextRels.some(
             (r) =>
@@ -328,10 +326,29 @@ export default function Home() {
     setPeople(nextPeople);
     setRelationships(nextRels);
     setProposals(nextProps);
+    setResolvedRefs(nextResolved);
     if (lastCreatedId) setSelectedId(lastCreatedId);
-    // First chat batch sets the speaker; later batches must not
-    // move it, or "my dad" changes meaning mid-conversation.
-    if (!egoId && firstCreatedId) setEgoId(firstCreatedId);
+    if (nextEgo !== egoId) setEgoId(nextEgo);
+  }
+
+  // Rejecting a person also drops the relationship cards that need
+  // them; otherwise those cards could only ever be accepted as no-ops.
+  function rejectProposals(toReject: Proposal[]) {
+    const rejected = new Set(toReject);
+    const droppedRefs = new Set(
+      toReject
+        .filter((p) => p.kind === "person" && p.tempId && !resolvedRefs[p.tempId])
+        .filter((p) => !people.some((x) => x.id === p.tempId))
+        .map((p) => p.tempId as string)
+    );
+    setProposals((prev) =>
+      prev.filter(
+        (x) =>
+          !rejected.has(x) &&
+          !(x.kind === "relationship" &&
+            ((x.fromRef && droppedRefs.has(x.fromRef)) || (x.toRef && droppedRefs.has(x.toRef))))
+      )
+    );
   }
 
   function manualAdd(e: React.FormEvent) {
@@ -433,7 +450,7 @@ export default function Home() {
               <h3>Proposals — review before they enter the tree</h3>
               {proposals.map((p) => (
                 <div key={p.id} className="proposal">
-                  <p>{describeProposal(p, people, proposals)}</p>
+                  <p>{describeProposal(p, people, proposals, resolvedRefs)}</p>
                   <small>
                     Confidence: {p.confidence} · {p.reason}
                   </small>
@@ -443,7 +460,7 @@ export default function Home() {
                     </button>
                     <button
                       className="btn btn-secondary btn-small"
-                      onClick={() => setProposals((prev) => prev.filter((x) => x.id !== p.id))}
+                      onClick={() => rejectProposals([p])}
                     >
                       Reject
                     </button>

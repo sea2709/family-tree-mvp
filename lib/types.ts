@@ -47,6 +47,9 @@ export type Proposal = {
   // Set by the client when the user picks "this is an existing person".
   // Only used for ambiguous same-name cases.
   existingPersonId?: string | null;
+  // Person proposal for the speaker ("I'm Lan"). Accepting it sets the
+  // tree's ego, whatever order the cards are accepted in.
+  isSpeaker?: boolean;
 };
 
 export type ChatMessage = {

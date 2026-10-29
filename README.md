@@ -49,8 +49,15 @@ times out, `/api/chat` falls back to a deterministic heuristic parser
 - “I'm Lan” / “My name is Lan”
 - “My dad is Minh, born 1960 in Hanoi”
 - “X is my mom”
-- “He married my mom, Hoa” / “married to Y”
-- “My brother / sister / son / daughter is X”
+- “He married my mom, Hoa” / “I am married to Y”
+- “My brother / sister / son / daughter / wife / husband is X”
+- “My parents are Minh and Hoa”
+- “Thuc's wife is Hang” / “My dad's brother is Tuan”
+- “They have 3 kids: Thanh Ha, Tra My and Anh Khoi”
+- “My brother's full name is Tran Dang Thuc. He was born in 1990”
+
+If a large model (e.g. `gemma4:31b`) keeps timing out, raise
+`OLLAMA_TIMEOUT_MS` in `.env.local` (default 90000).
 
 The chat header shows which path was used for the last message
 (`ollama:gemma4:12b` vs `fallback`).

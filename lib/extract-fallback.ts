@@ -1,4 +1,9 @@
-import type { Proposal, RosterPerson } from "./types";
+import type {
+  ChatHistoryItem,
+  Proposal,
+  RosterPerson,
+  RosterRelationship,
+} from "./types";
 
 export type ExtractResult = {
   reply: string;
@@ -37,7 +42,8 @@ function titleCaseName(name: string): string {
 }
 
 // "Hoa (Tran Hieu Hoa)" or "Tran Hieu Hoa (Hoa)" -> display is the
-// full name, the short name is the preferred name.
+// full name, the short name is the preferred name. A bare name
+// ("Hoa", "Tran Hieu Hoa") has no preferred name.
 function parseName(raw: string): {
   displayName: string;
   preferredName?: string;
@@ -70,7 +76,9 @@ function parseName(raw: string): {
 export function extractFallback(
   message: string,
   roster: RosterPerson[],
-  egoId: string | null
+  egoId: string | null,
+  relationships: RosterRelationship[] = [],
+  history: ChatHistoryItem[] = []
 ): ExtractResult {
   const proposals: Proposal[] = [];
   const personByTemp = new Map<string, string>(); // tempId -> displayName
@@ -99,6 +107,9 @@ export function extractFallback(
 
   // Returns a ref: an existing roster id, or a tempId for a proposal
   // created in this batch. Never creates two proposals for one name.
+  // "Hoa (Tran Hieu Hoa)" is stored as display Tran Hieu Hoa,
+  // preferred Hoa; a later bare "Hoa" reuses the same person, and a
+  // later full name upgrades a short-name-only proposal in place.
   const getOrCreate = (
     name: string,
     sentence: string,
@@ -118,6 +129,7 @@ export function extractFallback(
     for (const key of keys) {
       const already = tempByName.get(key);
       if (already) {
+        // Upgrade a short-name proposal to its full name, if given.
         const proposal = proposals.find(
           (p) => p.kind === "person" && p.tempId === already
         );
@@ -151,10 +163,73 @@ export function extractFallback(
     return tempId;
   };
 
+  // Graph helpers over the edges already in the tree (the second
+  // prompt's context). The roster alone cannot answer "my dad's
+  // brother" — it says Hoa exists, not that Hoa is Dang's dad.
+  const parentsOf = (id: string | null): string[] =>
+    id == null
+      ? []
+      : relationships
+          .filter((r) => r.type === "PARENT_OF" && r.toPersonId === id)
+          .map((r) => r.fromPersonId);
+  const siblingsOf = (id: string | null): string[] => {
+    if (id == null) return [];
+    const explicit = relationships
+      .filter(
+        (r) =>
+          r.type === "SIBLING_OF" &&
+          (r.fromPersonId === id || r.toPersonId === id)
+      )
+      .map((r) => (r.fromPersonId === id ? r.toPersonId : r.fromPersonId));
+    const parents = parentsOf(id);
+    const shared =
+      parents.length === 0
+        ? []
+        : relationships
+            .filter(
+              (r) =>
+                r.type === "PARENT_OF" &&
+                parents.includes(r.fromPersonId) &&
+                r.toPersonId !== id
+            )
+            .map((r) => r.toPersonId);
+    return [...new Set([...explicit, ...shared])];
+  };
+
+  // "My dad" vs "my mom" cannot be told apart from the graph alone
+  // (both are just parents, with no gender stored), so scan earlier
+  // user turns for "my dad name is Hoa" / "my mom name is Luan".
+  // This is what lets a second prompt's "my dad's brother" resolve.
+  const dadMomFromHistory = (): {
+    dad: string | null;
+    mom: string | null;
+  } => {
+    let dad: string | null = null;
+    let mom: string | null = null;
+    for (const h of history) {
+      if (h.role !== "user") continue;
+      const dadRe =
+        /\bmy\s+(?:dad|father)\s+(?:'s\s+)?(?:(?:name|nam)\s+)?is\s+([^.,;]+?)(?:,|\.|$|\s+and\s+my\s)/gi;
+      const momRe =
+        /\bmy\s+(?:mom|mother)\s+(?:'s\s+)?(?:(?:name|nam)\s+)?is\s+([^.,;]+?)(?:,|\.|$|\s+and\s+my\s)/gi;
+      for (const m of h.text.matchAll(dadRe)) {
+        const found = findRoster(cleanName(m[1]));
+        if (found) dad = found.id;
+      }
+      for (const m of h.text.matchAll(momRe)) {
+        const found = findRoster(cleanName(m[1]));
+        if (found) mom = found.id;
+      }
+    }
+    return { dad, mom };
+  };
+
+  let clarifyNote: string | null = null;
+
   const addRelationship = (
     fromRef: string,
     toRef: string,
-    type: "PARENT_OF" | "SPOUSE_OF" | "PARTNER_OF",
+    type: "PARENT_OF" | "SPOUSE_OF" | "PARTNER_OF" | "SIBLING_OF",
     sentence: string,
     confidence: Proposal["confidence"]
   ) => {
@@ -178,6 +253,13 @@ export function extractFallback(
     });
   };
 
+  // Seed dad/mom from earlier turns so a second prompt can resolve
+  // "my dad's brother" even though the graph stores no gender.
+  // A parent named in this message still overwrites the seed below.
+  const historyParents = dadMomFromHistory();
+  if (!dadRef) dadRef = historyParents.dad;
+  if (!momRef) momRef = historyParents.mom;
+
   const attachBirth = (sentence: string, ref: string | null) => {
     if (!ref) return;
     const born = sentence.match(
@@ -199,6 +281,9 @@ export function extractFallback(
     }
   };
 
+  // Split into sentences, then into clauses, so one sentence can
+  // carry two facts: "My dad name is Hoa (...), and my mom nam is
+  // Luan (...)" and "I have a brother, his name is Thuc (...)".
   const sentences = message
     .split(/(?<=[.!?])\s+/)
     .flatMap((s) =>
@@ -226,7 +311,8 @@ export function extractFallback(
       sentenceRef = ref;
       lastRef = ref;
       lastName = name;
-
+      // "My name is Dang, full name is Tran Hai Dang": upgrade the
+      // ego proposal to the full name, keeping Dang as preferred.
       const fullMatch = sentence.match(
         /\bfull name is\s+([A-Z][A-Za-z' -]+?)(?:[.,]|$)/i
       );
@@ -243,13 +329,16 @@ export function extractFallback(
       }
     }
 
-    // "I have a brother, his name is X" (split into two clauses above)
-    const haveSiblingMatch = sentence.match(/\bi have a (brother|sister)\b/i);
+    // 1b. "I have a brother/sister" (name comes in the next clause).
+    const haveSiblingMatch = sentence.match(
+      /\bi have a (brother|sister)\b/i
+    );
     if (haveSiblingMatch && !/\bname\s+is\b/i.test(sentence)) {
       pendingSiblingRole = haveSiblingMatch[1].toLowerCase() as
         | "brother"
         | "sister";
     }
+    // "..., his/her name is Thuc (...)" after "I have a brother".
     const hisNameMatch = sentence.match(
       /\b(?:his|her|their)\s+name\s+is\s+(.+?)(?:[.,]|$)/i
     );
@@ -263,10 +352,110 @@ export function extractFallback(
       pendingSiblingRole = null;
     }
 
-    // 2. "My dad/father/mom/mother/brother/sister/son/daughter is X",
-    //    also "My dad name is X", "My dad's name is X", "My mom nam is X"
+    // 1c. "My dad's brother/sister/mom/dad/wife/husband is X" — the
+    // second-prompt case. Dad/mom come from the history seed above,
+    // not from this sentence alone.
+    const myParentRelMatch = sentence.match(
+      /\bmy\s+(dad|father|mom|mother)'s\s+(brother|sister|mom|mother|dad|father|wife|husband)\s+is\s+(.+?)(?:[.,]|$)/i
+    );
+    if (myParentRelMatch) {
+      const parentRole = myParentRelMatch[1].toLowerCase();
+      const role2 = myParentRelMatch[2].toLowerCase();
+      const parentRef =
+        parentRole === "dad" || parentRole === "father" ? dadRef : momRef;
+      const name = cleanName(myParentRelMatch[3]);
+      const ref = getOrCreate(name, sentence, "high");
+      sentenceRef = ref;
+      lastRef = ref;
+      lastName = name;
+      if (parentRef) {
+        if (role2 === "brother" || role2 === "sister") {
+          addRelationship(parentRef, ref, "SIBLING_OF", sentence, "high");
+        } else if (
+          role2 === "mom" ||
+          role2 === "mother" ||
+          role2 === "dad" ||
+          role2 === "father"
+        ) {
+          addRelationship(ref, parentRef, "PARENT_OF", sentence, "high");
+        } else {
+          addRelationship(parentRef, ref, "SPOUSE_OF", sentence, "high");
+        }
+      } else {
+        clarifyNote = `I created ${name} but didn't link them yet, because I couldn't tell which of your parents is your ${parentRole} from the tree so far — tell me their name and I'll link them.`;
+        const person = proposals.find(
+          (p) => p.kind === "person" && p.tempId === ref
+        );
+        if (person) person.confidence = "medium";
+      }
+    }
+
+    // 1d. "My brother's wife/husband/son/daughter is X". The sibling
+    // is unambiguous only if the speaker has exactly one sibling
+    // in the graph; otherwise ask which one.
+    const mySiblingRelMatch = sentence.match(
+      /\bmy\s+(brother|sister)'s\s+(wife|husband|son|daughter)\s+is\s+(.+?)(?:[.,]|$)/i
+    );
+    if (mySiblingRelMatch && egoRef) {
+      const siblings = siblingsOf(egoRef);
+      const role2 = mySiblingRelMatch[2].toLowerCase();
+      const name = cleanName(mySiblingRelMatch[3]);
+      const ref = getOrCreate(name, sentence, "high");
+      sentenceRef = ref;
+      lastRef = ref;
+      lastName = name;
+      if (siblings.length === 1) {
+        const sib = siblings[0];
+        if (role2 === "wife" || role2 === "husband") {
+          addRelationship(sib, ref, "SPOUSE_OF", sentence, "high");
+        } else {
+          addRelationship(sib, ref, "PARENT_OF", sentence, "high");
+        }
+      } else {
+        clarifyNote = `I created ${name} but didn't link them yet, because I couldn't tell which sibling you mean — tell me their name and I'll link them.`;
+        const person = proposals.find(
+          (p) => p.kind === "person" && p.tempId === ref
+        );
+        if (person) person.confidence = "medium";
+      }
+    }
+
+    // 1e. "<Name>'s dad/mom/brother/sister/wife/husband/son/daughter is X"
+    const namedPossMatch = sentence.match(
+      /^([A-Z][A-Za-z' -]+?(?:\s*\([^)]+\))?)\s*'s\s+(dad|father|mom|mother|brother|sister|wife|husband|son|daughter)\s+is\s+(.+?)(?:[.,]|$)/i
+    );
+    // Guard: "My dad's brother ..." and "My brother's wife ..."
+    // are already handled above; without this guard the named
+    // pattern would create a bogus person called "My dad".
+    if (namedPossMatch && !/^\s*my\s/i.test(sentence)) {
+      const baseName = cleanName(namedPossMatch[1]);
+      const role = namedPossMatch[2].toLowerCase();
+      const name = cleanName(namedPossMatch[3]);
+      const baseRef = getOrCreate(baseName, sentence, "high");
+      const ref = getOrCreate(name, sentence, "high");
+      sentenceRef = ref;
+      lastRef = ref;
+      lastName = name;
+      if (role === "brother" || role === "sister") {
+        addRelationship(baseRef, ref, "SIBLING_OF", sentence, "high");
+      } else if (role === "wife" || role === "husband") {
+        addRelationship(baseRef, ref, "SPOUSE_OF", sentence, "high");
+      } else if (
+        role === "mom" ||
+        role === "mother" ||
+        role === "dad" ||
+        role === "father"
+      ) {
+        addRelationship(ref, baseRef, "PARENT_OF", sentence, "high");
+      } else {
+        addRelationship(baseRef, ref, "PARENT_OF", sentence, "high");
+      }
+    }
+
+    // 2. "My dad/father/mom/mother/brother/sister/son/daughter is X"
+    //    and "My dad/mom name is X" (also "dad's name is", "mom nam is").
     const relMatch = sentence.match(
-      /\bmy\s+(dad|father|mom|mother|brother|sister|son|daughter|child)(?:'s)?\s+(?:(?:name|nam)\s+)?is\s+([A-Z][A-Za-z' -]+?(?:\s*\([^)]+\))?)(?:,|\.|$|\s+born\b|\s+and\s+my\s)/i
+      /\bmy\s+(dad|father|mom|mother|brother|sister|son|daughter|child)\s+(?:'s\s+)?(?:(?:name|nam)\s+)?is\s+([A-Z][A-Za-z' -]+?(?:\s*\([^)]+\))?)(?:,|\.|$|\s+born\b|\s+and\s+my\s)/i
     );
     if (relMatch && egoRef) {
       const role = relMatch[1].toLowerCase();
@@ -282,9 +471,9 @@ export function extractFallback(
       } else if (role === "son" || role === "daughter" || role === "child") {
         addRelationship(egoRef, ref, "PARENT_OF", sentence, "high");
       } else {
-        // brother/sister: no direct edge type exists (siblings are
-        // derived from shared parents), so link via known parents
-        // after the loop.
+        // brother/sister: no direct edge type exists. Record the
+        // sibling and link it to the known parents at the end of
+        // the message, so siblings are derived from shared parents.
         siblingRefs.push({ ref, sentence });
         const person = proposals.find(
           (p) => p.kind === "person" && p.tempId === ref
@@ -375,9 +564,20 @@ export function extractFallback(
     if (sentenceRef) lastRef = sentenceRef;
   }
 
+  // Link every sibling mentioned in this message to the parents
+  // mentioned in the same message — or, on a second prompt, to
+  // the speaker's parents already in the graph. Without this, a
+  // later "I have a brother" floats unlinked even though the
+  // parents are already known.
+  const siblingParentRefs = [...new Set([
+    ...(dadRef ? [dadRef] : []),
+    ...(momRef ? [momRef] : []),
+    ...parentsOf(egoRef),
+  ])];
   for (const sibling of siblingRefs) {
-    if (dadRef) addRelationship(dadRef, sibling.ref, "PARENT_OF", sibling.sentence, "medium");
-    if (momRef) addRelationship(momRef, sibling.ref, "PARENT_OF", sibling.sentence, "medium");
+    for (const parentRef of siblingParentRefs) {
+      addRelationship(parentRef, sibling.ref, "PARENT_OF", sibling.sentence, "medium");
+    }
   }
 
   const personNames = proposals
@@ -401,6 +601,7 @@ export function extractFallback(
         " One note: “uncle”, “aunt”, and “cousin” are ambiguous, so I didn't guess which side of the family — " +
         "tell me whose sibling they are and I'll link them properly.";
     }
+    if (clarifyNote) reply += ` ${clarifyNote}`;
   }
   void lastName;
 

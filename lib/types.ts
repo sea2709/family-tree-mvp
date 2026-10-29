@@ -10,7 +10,11 @@ export type Person = {
   avatarUrl?: string | null;
 };
 
-export type RelationshipType = "PARENT_OF" | "SPOUSE_OF" | "PARTNER_OF";
+export type RelationshipType =
+  | "PARENT_OF"
+  | "SPOUSE_OF"
+  | "PARTNER_OF"
+  | "SIBLING_OF";
 
 export type Relationship = {
   id: string;
@@ -56,4 +60,10 @@ export type RosterPerson = Pick<
   "id" | "displayName" | "preferredName" | "birthYear" | "birthPlace"
 >;
 
+// What the page sends to /api/chat alongside the roster: the edges
+// already in the tree. Without these, a second prompt like
+// "my dad's brother is Tuan" cannot be resolved — the roster alone
+// says Hoa exists, but not that Hoa is Dang's dad.
 export type RosterRelationship = Pick<Relationship, "fromPersonId" | "toPersonId" | "type">;
+
+export type ChatHistoryItem = Pick<ChatMessage, "role" | "text">;

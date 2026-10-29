@@ -8,7 +8,13 @@ export type Person = {
   deathYear?: number | null;
   bio?: string | null;
   avatarUrl?: string | null;
+  // Only known when the chat used a gendered word ("my dad", "his
+  // sister", "Thuc's wife"). Lets a later "my dad" pick the right
+  // parent from the graph alone.
+  gender?: Gender | null;
 };
+
+export type Gender = "male" | "female";
 
 export type RelationshipType =
   | "PARENT_OF"
@@ -37,6 +43,7 @@ export type Proposal = {
   birthYear?: number | null;
   birthPlace?: string | null;
   bio?: string | null;
+  gender?: Gender | null;
   // For kind === "relationship". Each side is either an existing
   // person id or a tempId from a person proposal in the same batch.
   fromRef?: string;
@@ -60,7 +67,7 @@ export type ChatMessage = {
 
 export type RosterPerson = Pick<
   Person,
-  "id" | "displayName" | "preferredName" | "birthYear" | "birthPlace"
+  "id" | "displayName" | "preferredName" | "birthYear" | "birthPlace" | "gender"
 >;
 
 // What the page sends to /api/chat alongside the roster: the edges

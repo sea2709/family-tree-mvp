@@ -52,6 +52,36 @@ function scopeBatch(batch: Proposal[], people: Person[]): Proposal[] {
   }));
 }
 
+// A new-person card whose name matches someone already in the tree.
+function sameNamePerson(p: Proposal, people: Person[]): Person | undefined {
+  if (p.kind !== "person" || !p.displayName) return undefined;
+  if (p.tempId && people.some((x) => x.id === p.tempId)) return undefined;
+  const names = [p.displayName, p.preferredName]
+    .filter((n): n is string => !!n)
+    .map((n) => n.toLowerCase());
+  return people.find(
+    (x) =>
+      names.includes(x.displayName.toLowerCase()) ||
+      (!!x.preferredName && names.includes(x.preferredName.toLowerCase()))
+  );
+}
+
+// True when `ancestorId` is `personId` or one of their parents, grandparents…
+function isAncestor(ancestorId: string, personId: string, rels: Relationship[]): boolean {
+  const seen = new Set<string>();
+  const stack = [personId];
+  while (stack.length) {
+    const id = stack.pop() as string;
+    if (id === ancestorId) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    for (const r of rels) {
+      if (r.type === "PARENT_OF" && r.toPersonId === id) stack.push(r.fromPersonId);
+    }
+  }
+  return false;
+}
+
 function describeProposal(
   p: Proposal,
   people: Person[],
@@ -179,6 +209,7 @@ export default function Home() {
         preferredName: p.preferredName ?? null,
         birthYear: p.birthYear ?? null,
         birthPlace: p.birthPlace ?? null,
+        gender: p.gender ?? null,
       }));
       // Send the whole graph, not just the roster: without the
       // edges, a second prompt cannot be resolved ("my dad's
@@ -232,8 +263,6 @@ export default function Home() {
   }
 
   // Apply one or more proposals, resolving tempIds / existing ids.
-  // Existing people are matched by case-insensitive name so a
-  // same-name person is never silently duplicated.
   function applyProposals(toApply: Proposal[]) {
     let nextPeople = [...people];
     let nextRels = [...relationships];
@@ -241,33 +270,34 @@ export default function Home() {
     const nextResolved = { ...resolvedRefs };
     let nextEgo = egoId;
     let lastCreatedId: string | null = null;
+    const skipped: string[] = [];
 
-    // Accepts one person proposal: an update when its tempId is an
-    // existing id, a reuse on an exact name match, otherwise a new
-    // person. Either way the tempId is remembered for later cards.
+    // Accepts one person proposal: an update when its tempId (or
+    // existingPersonId) is an existing id, otherwise a new person.
+    // Either way the tempId is remembered for later cards.
+    // Same-name people are never merged silently ("my son Minh" is not
+    // "my dad Minh"); the card's "Same as existing" button sets
+    // existingPersonId when the user says they are one person.
     const acceptPerson = (p: Proposal): string | null => {
-      nextProps = nextProps.filter((x) => x !== p);
+      nextProps = nextProps.filter((x) => x.id !== p.id);
       let id: string | null = null;
-      const target = p.tempId ? nextPeople.find((x) => x.id === p.tempId) : undefined;
-      const byName = p.displayName
-        ? nextPeople.find((x) => x.displayName.toLowerCase() === p.displayName!.toLowerCase())
-        : undefined;
+      const targetId = p.existingPersonId ?? p.tempId;
+      const target = targetId ? nextPeople.find((x) => x.id === targetId) : undefined;
       if (target) {
-        const displayName = p.displayName ?? target.displayName;
+        const displayName = p.existingPersonId ? target.displayName : p.displayName ?? target.displayName;
         const updated: Person = {
           ...target,
           displayName,
           preferredName:
-            p.preferredName ??
+            (p.existingPersonId ? null : p.preferredName) ??
             (target.preferredName || (target.displayName !== displayName ? target.displayName : null)),
           birthYear: p.birthYear ?? target.birthYear ?? null,
           birthPlace: p.birthPlace ?? target.birthPlace ?? null,
           bio: p.bio ?? target.bio ?? null,
+          gender: target.gender ?? p.gender ?? null,
         };
         nextPeople = nextPeople.map((x) => (x.id === target.id ? updated : x));
         id = target.id;
-      } else if (byName) {
-        id = byName.id;
       } else if (p.displayName) {
         const created: Person = {
           id: uid(),
@@ -276,6 +306,7 @@ export default function Home() {
           birthYear: p.birthYear ?? null,
           birthPlace: p.birthPlace ?? null,
           bio: p.bio ?? null,
+          gender: p.gender ?? null,
         };
         nextPeople = [...nextPeople, created];
         lastCreatedId = created.id;
@@ -297,7 +328,7 @@ export default function Home() {
     };
 
     for (const p of toApply) {
-      if (!nextProps.includes(p)) continue;
+      if (!nextProps.some((x) => x.id === p.id)) continue;
       if (p.kind === "person") {
         acceptPerson(p);
       } else if (p.kind === "relationship") {
@@ -312,14 +343,21 @@ export default function Home() {
                   r.fromPersonId === toId &&
                   r.toPersonId === fromId))
           );
-          if (!duplicate && p.relationshipType) {
+          const cycle =
+            p.relationshipType === "PARENT_OF" && isAncestor(toId, fromId, nextRels);
+          if (cycle) {
+            const name = (id: string) => nextPeople.find((x) => x.id === id)?.displayName ?? "?";
+            skipped.push(
+              `I didn't add "${name(fromId)} is a parent of ${name(toId)}" because ${name(toId)} is already ${name(fromId)}'s parent or ancestor. If these are different people, add them separately.`
+            );
+          } else if (!duplicate && p.relationshipType) {
             nextRels = [
               ...nextRels,
               { id: uid(), fromPersonId: fromId, toPersonId: toId, type: p.relationshipType },
             ];
           }
         }
-        nextProps = nextProps.filter((x) => x !== p);
+        nextProps = nextProps.filter((x) => x.id !== p.id);
       }
     }
 
@@ -329,6 +367,12 @@ export default function Home() {
     setResolvedRefs(nextResolved);
     if (lastCreatedId) setSelectedId(lastCreatedId);
     if (nextEgo !== egoId) setEgoId(nextEgo);
+    if (skipped.length) {
+      setMessages((m) => [
+        ...m,
+        ...skipped.map((text) => ({ id: uid(), role: "assistant" as const, text })),
+      ]);
+    }
   }
 
   // Rejecting a person also drops the relationship cards that need
@@ -448,16 +492,33 @@ export default function Home() {
           {proposals.length > 0 && (
             <div className="proposals">
               <h3>Proposals — review before they enter the tree</h3>
-              {proposals.map((p) => (
+              {proposals.map((p) => {
+                const sameName = sameNamePerson(p, people);
+                return (
                 <div key={p.id} className="proposal">
                   <p>{describeProposal(p, people, proposals, resolvedRefs)}</p>
                   <small>
                     Confidence: {p.confidence} · {p.reason}
                   </small>
+                  {sameName && (
+                    <small>
+                      <br />
+                      ⚠ {sameName.displayName} is already in your tree. Accept adds a second person;
+                      use “Same as existing” if it is the same one.
+                    </small>
+                  )}
                   <div className="row">
                     <button className="btn btn-primary btn-small" onClick={() => applyProposals([p])}>
                       Accept
                     </button>
+                    {sameName && (
+                      <button
+                        className="btn btn-secondary btn-small"
+                        onClick={() => applyProposals([{ ...p, existingPersonId: sameName.id }])}
+                      >
+                        Same as existing {sameName.displayName}
+                      </button>
+                    )}
                     <button
                       className="btn btn-secondary btn-small"
                       onClick={() => rejectProposals([p])}
@@ -466,7 +527,8 @@ export default function Home() {
                     </button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
               <div className="row">
                 <button className="btn btn-primary btn-small" onClick={() => applyProposals([...proposals])}>
                   Accept all
@@ -658,7 +720,15 @@ export default function Home() {
                       <button
                         className="btn btn-secondary btn-small"
                         type="button"
-                        onClick={() => deletePerson(selected.id)}
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Delete ${selected.displayName} and all their relationships? This can't be undone.`
+                            )
+                          ) {
+                            deletePerson(selected.id);
+                          }
+                        }}
                       >
                         Delete person
                       </button>

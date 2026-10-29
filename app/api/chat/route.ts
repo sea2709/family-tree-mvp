@@ -27,13 +27,14 @@ Rules:
 - Every proposal must include the exact user quote it came from in "reason".
 - Output ONLY JSON, no prose, no markdown fences, with this exact shape:
 {
-  "reply": "a short friendly summary of what you think you heard, and what to confirm",
+  "reply": "a short friendly summary of what you think you heard, and what to confirm. Nothing is in the tree until the user accepts, so never say you added or saved anything; say what you propose instead",
   "proposals": [
     { "id": "p0", "kind": "person", "tempId": "temp-lan", "displayName": "Lan", "isSpeaker": true, "reason": "You said: \\"I'm Lan\\"", "confidence": "high" },
     { "id": "p1", "kind": "person", "tempId": "temp-minh", "displayName": "Minh", "birthYear": 1960, "birthPlace": "Hanoi", "reason": "You said: \\"...\\"", "confidence": "high" },
     { "id": "p2", "kind": "relationship", "fromRef": "temp-minh", "toRef": "<existing person id or tempId>", "relationshipType": "PARENT_OF", "reason": "You said: \\"...\\"", "confidence": "high" }
   ]
 }
+- Set "gender": "male" or "female" on a NEW person proposal when the words imply it (dad, father, brother, son, husband, he/his → male; mom, mother, sister, daughter, wife, she/her → female). Omit it otherwise. Never guess gender from a name.
 - Set "isSpeaker": true only on the person proposal for the speaker themself ("I'm Lan", "My name is Dang"), and only when no speaker id is set yet.
 - kind is only "person" or "relationship". relationshipType is only "PARENT_OF" (from = parent, to = child), "SPOUSE_OF", "PARTNER_OF", or "SIBLING_OF" (symmetric, store once). fromRef/toRef must be an existing roster id or a tempId from a person proposal in the same response. Grandparents, aunts/uncles and cousins are derived from parent/spouse/sibling edges, never emitted as their own edge types.
 - If nothing clear can be extracted, return an empty proposals array and a reply asking for one fact, e.g. "My dad is Minh, born 1960 in Hanoi".`;
@@ -108,6 +109,7 @@ function normalizeProposals(
       birthYear: typeof p.birthYear === "number" ? p.birthYear : null,
       birthPlace: typeof p.birthPlace === "string" ? p.birthPlace : null,
       bio: typeof p.bio === "string" ? p.bio : null,
+      gender: p.gender === "male" || p.gender === "female" ? p.gender : null,
       fromRef: typeof p.fromRef === "string" ? p.fromRef : undefined,
       toRef: typeof p.toRef === "string" ? p.toRef : undefined,
       relationshipType:
@@ -189,14 +191,18 @@ function normalizeHistory(raw: unknown): ChatHistoryItem[] {
 function relationToEgo(
   personId: string,
   egoId: string | null,
-  rels: RosterRelationship[]
+  rels: RosterRelationship[],
+  roster: RosterPerson[]
 ): string | null {
   if (!egoId) return null;
   if (personId === egoId) return "the speaker";
   const parentsOf = (id: string) =>
     rels.filter((r) => r.type === "PARENT_OF" && r.toPersonId === id).map((r) => r.fromPersonId);
   const egoParents = parentsOf(egoId);
-  if (egoParents.includes(personId)) return "speaker's parent";
+  if (egoParents.includes(personId)) {
+    const gender = roster.find((p) => p.id === personId)?.gender;
+    return gender === "male" ? "speaker's father" : gender === "female" ? "speaker's mother" : "speaker's parent";
+  }
   if (parentsOf(personId).includes(egoId)) return "speaker's child";
   const linked = (r: RosterRelationship) =>
     (r.fromPersonId === egoId && r.toPersonId === personId) ||
@@ -226,8 +232,9 @@ function buildUserPrompt(
             const aka = p.preferredName && p.preferredName !== p.displayName ? ` (${p.preferredName})` : "";
             const born = p.birthYear ? `, born ${p.birthYear}` : "";
             const place = p.birthPlace ? ` in ${p.birthPlace}` : "";
-            const relation = relationToEgo(p.id, egoId, rels);
-            return `- ${p.id}: ${p.displayName}${aka}${born}${place}${relation ? ` — ${relation}` : ""}`;
+            const relation = relationToEgo(p.id, egoId, rels, roster);
+            const gender = p.gender ? `, ${p.gender}` : "";
+            return `- ${p.id}: ${p.displayName}${aka}${born}${place}${gender}${relation ? ` — ${relation}` : ""}`;
           })
           .join("\n")
       : "- (none yet)";

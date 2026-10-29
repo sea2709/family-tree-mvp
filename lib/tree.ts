@@ -51,18 +51,31 @@ export function getSiblings(
   people: Person[],
   rels: Relationship[]
 ): Person[] {
+  const explicitIds = rels
+    .filter(
+      (r) =>
+        r.type === "SIBLING_OF" &&
+        (r.fromPersonId === personId || r.toPersonId === personId)
+    )
+    .map((r) => (r.fromPersonId === personId ? r.toPersonId : r.fromPersonId));
   const parents = getParents(personId, people, rels).map((p) => p.id);
-  if (parents.length === 0) return [];
-  return people.filter(
-    (p) =>
-      p.id !== personId &&
-      rels.some(
-        (r) =>
-          r.type === "PARENT_OF" &&
-          r.toPersonId === p.id &&
-          parents.includes(r.fromPersonId)
-      )
-  );
+  const sharedParentIds =
+    parents.length === 0
+      ? []
+      : people
+          .filter(
+            (p) =>
+              p.id !== personId &&
+              rels.some(
+                (r) =>
+                  r.type === "PARENT_OF" &&
+                  r.toPersonId === p.id &&
+                  parents.includes(r.fromPersonId)
+              )
+          )
+          .map((p) => p.id);
+  const ids = new Set([...explicitIds, ...sharedParentIds]);
+  return people.filter((p) => ids.has(p.id));
 }
 
 export type PositionedPerson = Person & { x: number; y: number; generation: number };
@@ -93,6 +106,21 @@ export function layoutTree(people: Person[], rels: Relationship[]): PositionedPe
       }
     }
   }
+  // Explicit siblings share a generation too (e.g. a dad's brother
+  // linked with SIBLING_OF when the grandparents are unknown).
+  for (const r of rels) {
+    if (r.type === "SIBLING_OF") {
+      const a = generation.get(r.fromPersonId);
+      const b = generation.get(r.toPersonId);
+      if (a !== undefined && b === undefined) {
+        generation.set(r.toPersonId, a);
+        queue.push(r.toPersonId);
+      } else if (b !== undefined && a === undefined) {
+        generation.set(r.fromPersonId, b);
+        queue.push(r.fromPersonId);
+      }
+    }
+  }
   while (queue.length > 0) {
     const id = queue.shift()!;
     const gen = generation.get(id) ?? 0;
@@ -106,6 +134,12 @@ export function layoutTree(people: Person[], rels: Relationship[]): PositionedPe
       if (!generation.has(spouse.id)) {
         generation.set(spouse.id, gen);
         queue.push(spouse.id);
+      }
+    }
+    for (const sibling of getSiblings(id, people, rels)) {
+      if (!generation.has(sibling.id)) {
+        generation.set(sibling.id, gen);
+        queue.push(sibling.id);
       }
     }
   }

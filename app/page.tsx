@@ -36,7 +36,8 @@ function describeProposal(
   proposals: Proposal[]
 ): string {
   if (p.kind === "person") {
-    const name = p.displayName ?? "Unnamed person";
+    const name =
+      p.displayName ?? "Unnamed person";
     const bits = [
       p.preferredName && p.preferredName !== name
         ? `${name} (${p.preferredName})`
@@ -58,6 +59,7 @@ function describeProposal(
   if (p.relationshipType === "PARENT_OF") return `${from} is a parent of ${to}`;
   if (p.relationshipType === "SPOUSE_OF") return `${from} is married to ${to}`;
   if (p.relationshipType === "PARTNER_OF") return `${from} is a partner of ${to}`;
+  if (p.relationshipType === "SIBLING_OF") return `${from} is a sibling of ${to}`;
   return `${from} is related to ${to}`;
 }
 
@@ -72,6 +74,11 @@ export default function Home() {
     },
   ]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
+  // The speaker, set once from the first chat batch and then kept
+  // stable. Previously egoId was people[0], which changed if the
+  // user accepted proposals in a different order — so a second
+  // prompt's "my dad" could suddenly mean someone else's dad.
+  const [egoId, setEgoId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -94,6 +101,7 @@ export default function Home() {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed.people)) setPeople(parsed.people);
         if (Array.isArray(parsed.relationships)) setRelationships(parsed.relationships);
+        if (typeof parsed.egoId === "string") setEgoId(parsed.egoId);
       }
     } catch {
       // Corrupt storage: start fresh rather than crashing.
@@ -104,12 +112,15 @@ export default function Home() {
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ people, relationships }));
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ people, relationships, egoId })
+      );
     } catch {
       // localStorage full (e.g. large avatar data URLs): ignore, tree
       // still works for this session.
     }
-  }, [people, relationships, loaded]);
+  }, [people, relationships, egoId, loaded]);
 
   const selected = people.find((p) => p.id === selectedId) ?? null;
 
@@ -142,10 +153,29 @@ export default function Home() {
         birthYear: p.birthYear ?? null,
         birthPlace: p.birthPlace ?? null,
       }));
+      // Send the whole graph, not just the roster: without the
+      // edges, a second prompt cannot be resolved ("my dad's
+      // brother" needs to know who "my dad" is). History is sent
+      // too, so pronouns and "my dad" in a later turn resolve
+      // against what the user already said.
+      const graph = relationships.map((r) => ({
+        fromPersonId: r.fromPersonId,
+        toPersonId: r.toPersonId,
+        type: r.type,
+      }));
+      const history = [...messages, { id: "current", role: "user" as const, text }]
+        .slice(-8)
+        .map((m) => ({ role: m.role, text: m.text }));
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, roster, egoId: people[0]?.id ?? null }),
+        body: JSON.stringify({
+          message: text,
+          roster,
+          relationships: graph,
+          history,
+          egoId: egoId ?? people[0]?.id ?? null,
+        }),
       });
       const data = await res.json();
       setMessages((m) => [
@@ -182,6 +212,7 @@ export default function Home() {
     let nextRels = [...relationships];
     let nextProps = [...proposals];
     let lastCreatedId: string | null = null;
+    let firstCreatedId: string | null = null;
 
     const ensurePerson = (ref?: string): string | null => {
       if (!ref) return null;
@@ -200,6 +231,7 @@ export default function Home() {
         nextPeople = [...nextPeople, created];
         nextProps = nextProps.filter((x) => x !== pending);
         lastCreatedId = created.id;
+        if (!firstCreatedId) firstCreatedId = created.id;
         return created.id;
       }
       return null;
@@ -229,6 +261,7 @@ export default function Home() {
           };
           nextPeople = [...nextPeople, created];
           lastCreatedId = created.id;
+          if (!firstCreatedId) firstCreatedId = created.id;
         }
         nextProps = nextProps.filter((x) => x !== p);
       } else if (p.kind === "relationship") {
@@ -278,6 +311,9 @@ export default function Home() {
     setRelationships(nextRels);
     setProposals(nextProps);
     if (lastCreatedId) setSelectedId(lastCreatedId);
+    // First chat batch sets the speaker; later batches must not
+    // move it, or "my dad" changes meaning mid-conversation.
+    if (!egoId && firstCreatedId) setEgoId(firstCreatedId);
   }
 
   function manualAdd(e: React.FormEvent) {
@@ -344,6 +380,7 @@ export default function Home() {
       prev.filter((r) => r.fromPersonId !== id && r.toPersonId !== id)
     );
     if (selectedId === id) setSelectedId(null);
+    if (egoId === id) setEgoId(null);
   }
 
   return (

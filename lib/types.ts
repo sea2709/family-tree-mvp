@@ -18,6 +18,20 @@ export type Person = {
 
 export type Gender = "male" | "female";
 
+// Metadata only; the image bytes live in IndexedDB (lib/photo-store.ts)
+// under the same id. A photo with no personIds belongs to the tree as a
+// whole. Ids of deleted people are ignored when rendering so that Undo
+// can bring the tags back.
+export type Photo = {
+  id: string;
+  personIds: string[];
+  caption?: string | null;
+  takenYear?: number | null;
+  width: number;
+  height: number;
+  createdAt: string;
+};
+
 export type RelationshipType =
   | "PARENT_OF"
   | "SPOUSE_OF"

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMessage, Gender, Person, Proposal, Relationship } from "@/lib/types";
+import type { ChatMessage, Gender, Person, Photo, Proposal, Relationship } from "@/lib/types";
 import {
   familyConnectors,
   getChildren,
@@ -12,7 +12,7 @@ import {
   relationLabel,
   type LayoutSize,
 } from "@/lib/tree";
-import { DownloadIcon, ResetIcon, UploadIcon, UserPlusIcon } from "./icons";
+import { DownloadIcon, PhotoIcon, ResetIcon, UploadIcon, UserPlusIcon } from "./icons";
 import {
   applyProposalBatch,
   batchOf,
@@ -25,6 +25,9 @@ import {
   type TreeState,
 } from "@/lib/proposals";
 import { birthLabel, yearOf } from "@/lib/dates";
+import { resizeImage, shrinkImage } from "@/lib/images";
+import { deletePhotoBlobs, getPhotoBlob, isQuotaError, putPhotoBlobs, requestPersistence } from "@/lib/photo-store";
+import { PhotoGrid, PhotoViewer, TreeGalleryDialog } from "./photos";
 import { MAX_FILE_BYTES, exportFileName, parseTreeFile, serializeTree, type TreeFile } from "@/lib/tree-file";
 
 const STORAGE_KEY = "family-tree-mvp-v1";
@@ -95,32 +98,15 @@ function relativeEdges(
     : [edge(anchorId, newId, "SIBLING_OF")];
 }
 
-// Avatars are stored as data URLs in localStorage, which caps out at a
-// few MB; a phone photo would silently stop the tree from saving.
-function shrinkImage(file: File, size = 160): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement("canvas");
-      canvas.width = size;
-      canvas.height = size;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return reject(new Error("no canvas"));
-      const side = Math.min(img.width, img.height);
-      ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size);
-      URL.revokeObjectURL(url);
-      resolve(canvas.toDataURL("image/jpeg", 0.85));
-    };
-    img.onerror = reject;
-    img.src = url;
-  });
-}
-
 export default function Home() {
   const [people, setPeople] = useState<Person[]>([]);
   const [relationships, setRelationships] = useState<Relationship[]>([]);
   const [egoId, setEgoId] = useState<string | null>(null);
+  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [showPhotos, setShowPhotos] = useState(false);
+  const [viewPhotoId, setViewPhotoId] = useState<string | null>(null);
+  // Which gallery is uploading: a person id, or "tree" for the family gallery.
+  const [photoBusy, setPhotoBusy] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [resolvedRefs, setResolvedRefs] = useState<Record<string, string>>({});
@@ -175,6 +161,16 @@ export default function Home() {
         if (Array.isArray(parsed.people)) savedPeople = parsed.people;
         if (Array.isArray(parsed.relationships)) setRelationships(parsed.relationships);
         if (typeof parsed.egoId === "string") setEgoId(parsed.egoId);
+        if (Array.isArray(parsed.photos)) {
+          // Undo can't outlive a reload, so tags of deleted people can go.
+          const live = new Set(savedPeople.map((p) => p.id));
+          setPhotos(
+            (parsed.photos as Photo[]).map((ph) => ({
+              ...ph,
+              personIds: (ph.personIds ?? []).filter((id) => live.has(id)),
+            }))
+          );
+        }
       }
       setPeople(savedPeople);
       const chatRaw = localStorage.getItem(CHAT_KEY);
@@ -213,11 +209,11 @@ export default function Home() {
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ people, relationships, egoId }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ people, relationships, egoId, photos }));
     } catch {
       showToast({ label: "Couldn't save — browser storage is full." });
     }
-  }, [people, relationships, egoId, loaded]);
+  }, [people, relationships, egoId, photos, loaded]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -271,13 +267,15 @@ export default function Home() {
       if (e.key !== "Escape") return;
       if (pendingImport) setPendingImport(null);
       else if (confirmReset) setConfirmReset(false);
+      else if (viewPhotoId) setViewPhotoId(null);
+      else if (showPhotos) setShowPhotos(false);
       else if (showAdd) setShowAdd(false);
       else if (quickAdd) setQuickAdd(null);
       else setSelectedId(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [pendingImport, confirmReset, showAdd, quickAdd]);
+  }, [pendingImport, confirmReset, viewPhotoId, showPhotos, showAdd, quickAdd]);
 
   useEffect(() => {
     setQuickAdd(null);
@@ -518,6 +516,7 @@ export default function Home() {
   }
 
   const selected = people.find((p) => p.id === selectedId) ?? null;
+  const viewingPhoto = photos.find((p) => p.id === viewPhotoId) ?? null;
   const firstName = (p: Person) => p.preferredName || p.displayName.split(/\s+/).slice(-1)[0];
   const ego = people.find((p) => p.id === egoId) ?? null;
 
@@ -591,6 +590,67 @@ export default function Home() {
       patchPerson(id, { avatarUrl: await shrinkImage(file) });
     } catch {
       showToast({ label: "That file couldn't be read as an image." });
+    }
+  }
+
+  // --- Photos ------------------------------------------------------------
+
+  async function addPhotos(files: File[], personIds: string[]) {
+    setPhotoBusy(personIds[0] ?? "tree");
+    requestPersistence();
+    const added: Photo[] = [];
+    let unreadable = 0;
+    let problem: string | null = null;
+    try {
+      for (const file of files) {
+        let full, thumb;
+        try {
+          full = await resizeImage(file, 2000);
+          thumb = await resizeImage(full.blob, 400);
+        } catch {
+          unreadable++;
+          continue;
+        }
+        const id = uid();
+        await putPhotoBlobs(id, { full: full.blob, thumb: thumb.blob });
+        added.push({ id, personIds, width: full.width, height: full.height, createdAt: new Date().toISOString() });
+      }
+    } catch (err) {
+      problem = isQuotaError(err) ? "Couldn't save — browser storage is full." : "Couldn't save that photo.";
+    }
+    if (added.length) setPhotos((prev) => [...prev, ...added]);
+    setPhotoBusy(null);
+    if (problem) showToast({ label: problem });
+    else if (unreadable) {
+      showToast({
+        label:
+          unreadable === files.length
+            ? "That file couldn't be read as an image."
+            : `${unreadable} of ${files.length} files couldn't be read as images.`,
+      });
+    }
+  }
+
+  function updatePhoto(id: string, patch: Partial<Photo>) {
+    setPhotos((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  }
+
+  function deletePhoto(id: string) {
+    setPhotos((prev) => prev.filter((p) => p.id !== id));
+    setViewPhotoId(null);
+    deletePhotoBlobs(id).catch(() => {});
+    showToast({ label: "Photo deleted" });
+  }
+
+  async function setAvatarFromPhoto(photoId: string, personId: string) {
+    try {
+      const blob = await getPhotoBlob(photoId, "full");
+      if (!blob) throw new Error("missing photo");
+      patchPerson(personId, { avatarUrl: await shrinkImage(blob) });
+      const name = people.find((p) => p.id === personId)?.displayName ?? "their";
+      showToast({ label: `Updated ${name}'s avatar` });
+    } catch {
+      showToast({ label: "Couldn't use that photo as an avatar." });
     }
   }
 
@@ -1204,6 +1264,10 @@ export default function Home() {
             <ResetIcon />
             Reset
           </button>
+          <button className="pt-btn pt-btn-secondary pt-btn-icon" onClick={() => setShowPhotos(true)}>
+            <PhotoIcon />
+            Photos{photos.length ? ` (${photos.length})` : ""}
+          </button>
           <button className="pt-btn pt-btn-secondary pt-btn-icon" onClick={() => setShowAdd(true)}>
             <UserPlusIcon />
             Person
@@ -1368,6 +1432,10 @@ export default function Home() {
               onClose={() => setSelectedId(null)}
               onPatch={(patch) => patchPerson(selected.id, patch)}
               onAvatar={(f) => uploadAvatar(selected.id, f)}
+              photos={photos.filter((p) => p.personIds.includes(selected.id))}
+              photoBusy={photoBusy === selected.id}
+              onAddPhotos={(files) => addPhotos(files, [selected.id])}
+              onOpenPhoto={setViewPhotoId}
               onSelect={selectAndReveal}
               onAddRelative={(kind, name, coParentId) =>
                 addRelative(selected.id, kind, { displayName: name }, coParentId)
@@ -1389,6 +1457,29 @@ export default function Home() {
             setShowAdd(false);
             selectAndReveal(id);
           }}
+        />
+      )}
+
+      {showPhotos && (
+        <TreeGalleryDialog
+          photos={photos}
+          people={people}
+          busy={photoBusy === "tree"}
+          onAdd={(files) => addPhotos(files, [])}
+          onOpen={setViewPhotoId}
+          onClose={() => setShowPhotos(false)}
+        />
+      )}
+
+      {viewingPhoto && (
+        <PhotoViewer
+          key={viewingPhoto.id}
+          photo={viewingPhoto}
+          people={people}
+          onPatch={(patch) => updatePhoto(viewingPhoto.id, patch)}
+          onSetAvatar={(personId) => setAvatarFromPhoto(viewingPhoto.id, personId)}
+          onDelete={() => deletePhoto(viewingPhoto.id)}
+          onClose={() => setViewPhotoId(null)}
         />
       )}
 
@@ -1435,6 +1526,10 @@ function PersonDrawer(props: {
   onClose: () => void;
   onPatch: (patch: Partial<Person>) => void;
   onAvatar: (file: File | undefined) => void;
+  photos: Photo[];
+  photoBusy: boolean;
+  onAddPhotos: (files: File[]) => void;
+  onOpenPhoto: (id: string) => void;
   onSelect: (id: string) => void;
   onAddRelative: (kind: RelativeKind, name: string, coParentId: string | null) => void;
   onSetEgo: () => void;
@@ -1552,6 +1647,15 @@ function PersonDrawer(props: {
           </label>
         </div>
         <small className="pt-hint">Changes save automatically.</small>
+
+        <h3>Photos</h3>
+        <PhotoGrid
+          photos={props.photos}
+          people={people}
+          busy={props.photoBusy}
+          onAdd={props.onAddPhotos}
+          onOpen={props.onOpenPhoto}
+        />
 
         <h3>Family</h3>
         {groups.map((g) => (

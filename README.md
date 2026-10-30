@@ -100,7 +100,14 @@ The chat header shows which path was used for the last message
    ("Mother", "Sister-in-law"), and draws parent/child links as family
    bars. Cards can be dragged (positions are saved; "Tidy up" resets
    them), and the canvas zooms and fits. Clicking a card opens a side
-   panel to edit details, the story, the photo, and to add relatives.
+   panel to edit details, the story, the avatar and photos, and to add
+   relatives.
+5. **Photos** — the "Photos" button opens a family-wide gallery, and
+   each person's panel has their own. One photo can be tagged with
+   several people, so a wedding photo shows up on everyone's page.
+   Uploads are resized (2000px long edge plus a 400px thumbnail) and
+   stored in IndexedDB; only captions, years, and tags go in
+   localStorage with the tree.
 
 Try it with:
 
@@ -114,10 +121,11 @@ parents, linked as spouses.
 In: chat extraction, proposal review with tree preview and undo,
 draggable/zoomable tree, relationship labels, person details,
 bio/story editing, avatar upload (resized, stored as a data URL),
-manual add/edit/delete, localStorage persistence (tree, chat
-history, and card positions), and JSON export/import of the tree
-(people, links, photos, stories, and card positions) via the
-Export / Import buttons in the header.
+photo galleries for the family and each person (IndexedDB), manual
+add/edit/delete, localStorage persistence (tree, chat history, and
+card positions), and JSON export/import of the tree (people, links,
+avatars, stories, and card positions) via the Export / Import buttons
+in the header.
 
 Out (for later): user accounts and sharing, a real database,
 React Flow, GEDCOM import/export, voice recording, AI avatar
@@ -129,6 +137,10 @@ generation, automatic duplicate merging, timeline view.
   with Prisma + Postgres (a `Person` table and a `Relationship`
   table, as sketched in the data-model note). The `Person` /
   `Relationship` types in `lib/types.ts` already match that shape.
+  Photos would become a `Photo` table plus files in object storage
+  (S3, R2) uploaded via presigned URLs, replacing `lib/photo-store.ts`.
+  Until then, photos live only in this browser and are not part of
+  any export.
 - **Tree rendering:** the hand-rolled layout in `lib/tree.ts` plus
   drag/zoom in `app/page.tsx` is enough for one family; swap to React
   Flow for panning, minimaps, or very large trees.

@@ -185,6 +185,7 @@ button { cursor: pointer; }
 .pt-node.pending .pt-initials { background: transparent; border: 1.5px dashed var(--marigold); }
 .pt-node-text { display: flex; flex-direction: column; min-width: 0; }
 .pt-node-name { font-weight: 700; font-size: 14px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-node-preferred { font-weight: 500; color: var(--muted); }
 .pt-node-meta { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .pt-zoom { position: absolute; top: 12px; left: 12px; display: flex; background: #fff; border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--pt-shadow); overflow: hidden; }
@@ -240,7 +241,17 @@ button { cursor: pointer; }
 .pt-family-head { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
 .pt-none { font-size: 12.5px; color: var(--muted); }
 .pt-quick-add { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
-.pt-quick-add input { flex: 1; min-width: 140px; }
+.pt-combo { position: relative; flex: 1; min-width: 140px; display: flex; }
+.pt-quick-add .pt-combo input { flex: 1; min-width: 0; }
+.pt-suggest {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 5; margin: 0; padding: 4px; list-style: none;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  max-height: 260px; overflow-y: auto;
+}
+.pt-suggest li { display: flex; flex-direction: column; gap: 1px; padding: 6px 8px; border-radius: 6px; cursor: pointer; font-size: 13.5px; }
+.pt-suggest li small { font-size: 11.5px; color: var(--muted); }
+.pt-suggest li[aria-selected="true"] { background: var(--marigold-soft); }
+.pt-suggest-new { font-style: italic; color: var(--muted); }
 .pt-check { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); flex-basis: 100%; }
 
 /* Dialog + toast */

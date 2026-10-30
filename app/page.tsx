@@ -25,6 +25,7 @@ import {
   type TreeState,
 } from "@/lib/proposals";
 import { birthLabel, yearOf } from "@/lib/dates";
+import { matchPeople, relativeCandidates, type RelativeKind } from "@/lib/people-search";
 import { resizeImage, shrinkImage } from "@/lib/images";
 import { deletePhotoBlobs, getPhotoBlob, isQuotaError, putPhotoBlobs, requestPersistence } from "@/lib/photo-store";
 import { PhotoGrid, PhotoViewer, TreeGalleryDialog } from "./photos";
@@ -42,7 +43,6 @@ const MIN_ZOOM = 0.4;
 const MAX_ZOOM = 1.6;
 
 type Message = ChatMessage & { batchId?: string; tone?: "error" | "muted" };
-type RelativeKind = "parent" | "partner" | "child" | "sibling";
 type Toast = { label: string; onUndo?: () => void };
 type Point = { x: number; y: number };
 type DragState = { id: string; startX: number; startY: number; origin: Point; at: Point; moved: boolean };
@@ -566,6 +566,19 @@ export default function Home() {
     );
     setRecentIds(new Set([person.id]));
     return person.id;
+  }
+
+  function linkRelative(anchorId: string, kind: RelativeKind, existingId: string, coParentId: string | null) {
+    const before = snapshot();
+    const exists = (e: Relationship) =>
+      relationships.some(
+        (r) => r.type === e.type && r.fromPersonId === e.fromPersonId && r.toPersonId === e.toPersonId
+      );
+    const edges = relativeEdges(anchorId, existingId, kind, relationships, coParentId).filter((e) => !exists(e));
+    if (edges.length === 0) return;
+    const name = people.find((p) => p.id === existingId)?.displayName ?? "person";
+    commit({ ...before, relationships: [...relationships, ...edges] }, `Linked ${name}`, before);
+    setRecentIds(new Set([existingId]));
   }
 
   function deletePerson(id: string) {
@@ -1165,6 +1178,8 @@ export default function Home() {
   function renderNode(p: (typeof positioned)[number]) {
     const pending = preview.pendingIds.has(p.id);
     const label = relationLabel(viewEgo, p.id, allPeople, allRels);
+    const showPreferred = !!p.preferredName && p.preferredName !== p.displayName;
+    const nodeName = showPreferred ? `${p.displayName} (${p.preferredName})` : p.displayName;
     const classes = [
       "pt-node",
       pending && "pending",
@@ -1198,8 +1213,8 @@ export default function Home() {
         }}
         title={
           pending
-            ? `${p.displayName} — waiting for your review in chat`
-            : `${p.displayName} — arrow keys move between people; drag or Alt+arrow keys to move this card`
+            ? `${nodeName} — waiting for your review in chat`
+            : `${nodeName} — arrow keys move between people; drag or Alt+arrow keys to move this card`
         }
       >
         {p.avatarUrl ? (
@@ -1209,7 +1224,12 @@ export default function Home() {
           <span className="pt-avatar pt-initials">{initials(p.displayName)}</span>
         )}
         <span className="pt-node-text">
-          <span className="pt-node-name">{p.displayName}</span>
+          <span className="pt-node-name">
+            {p.displayName}
+            {showPreferred && (
+              <span className="pt-node-preferred"> ({p.preferredName})</span>
+            )}
+          </span>
           <span className="pt-node-meta">
             {[pending ? "New" : label, birthLabel(p) ? `b. ${birthLabel(p)}` : null].filter(Boolean).join(" · ")}
           </span>
@@ -1440,6 +1460,8 @@ export default function Home() {
               onAddRelative={(kind, name, coParentId) =>
                 addRelative(selected.id, kind, { displayName: name }, coParentId)
               }
+              onLinkRelative={(kind, id, coParentId) => linkRelative(selected.id, kind, id, coParentId)}
+              egoId={egoId}
               onSetEgo={() => setEgoId(selected.id)}
               onDelete={() => deletePerson(selected.id)}
             />
@@ -1532,6 +1554,8 @@ function PersonDrawer(props: {
   onOpenPhoto: (id: string) => void;
   onSelect: (id: string) => void;
   onAddRelative: (kind: RelativeKind, name: string, coParentId: string | null) => void;
+  onLinkRelative: (kind: RelativeKind, personId: string, coParentId: string | null) => void;
+  egoId: string | null;
   onSetEgo: () => void;
   onDelete: () => void;
 }) {
@@ -1545,16 +1569,56 @@ function PersonDrawer(props: {
   const partners = groups[1].list;
   const soloPartner = partners.length === 1 ? partners[0] : null;
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const [listOpen, setListOpen] = useState(true);
+
+  const coParentId = quickAdd?.kind === "child" && quickAdd.withPartner && soloPartner ? soloPartner.id : null;
+  const candidates = useMemo(
+    () => (quickAdd ? relativeCandidates(quickAdd.kind, person.id, people, relationships, coParentId) : []),
+    [quickAdd?.kind, coParentId, person.id, people, relationships]
+  );
+  const matches = useMemo(
+    () => (quickAdd ? matchPeople(quickAdd.name, candidates, relationships) : []),
+    [quickAdd?.name, candidates, relationships]
+  );
+  const showList = listOpen && !!quickAdd?.name.trim();
+  // Rows are the matches followed by the "Add new" row.
+  const rowCount = matches.length + 1;
+
+  function setName(name: string) {
+    if (!quickAdd) return;
+    setQuickAdd({ ...quickAdd, name });
+    setActiveIndex(-1);
+    setListOpen(true);
+  }
+
+  function pick(index: number) {
+    if (!quickAdd) return;
+    const match = matches[index];
+    if (match) props.onLinkRelative(quickAdd.kind, match.id, coParentId);
+    else if (quickAdd.name.trim()) props.onAddRelative(quickAdd.kind, quickAdd.name.trim(), coParentId);
+    else return;
+    setQuickAdd({ ...quickAdd, name: "" });
+    setActiveIndex(-1);
+  }
 
   function submitQuickAdd(e: React.FormEvent) {
     e.preventDefault();
-    if (!quickAdd?.name.trim()) return;
-    props.onAddRelative(
-      quickAdd.kind,
-      quickAdd.name.trim(),
-      quickAdd.kind === "child" && quickAdd.withPartner && soloPartner ? soloPartner.id : null
-    );
-    setQuickAdd({ ...quickAdd, name: "" });
+    pick(showList ? activeIndex : -1);
+  }
+
+  function onQuickAddKey(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Escape" && showList) {
+      e.stopPropagation();
+      setListOpen(false);
+      setActiveIndex(-1);
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (!quickAdd?.name.trim()) return;
+      e.preventDefault();
+      setListOpen(true);
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      setActiveIndex((i) => (i < 0 && step < 0 ? rowCount - 1 : (i + step + rowCount) % rowCount));
+    }
   }
 
   return (
@@ -1679,12 +1743,56 @@ function PersonDrawer(props: {
             </div>
             {quickAdd?.kind === g.kind && (
               <form className="pt-quick-add" onSubmit={submitQuickAdd}>
-                <input
-                  autoFocus
-                  value={quickAdd.name}
-                  placeholder={`${KIND_LABEL[g.kind]}'s name`}
-                  onChange={(e) => setQuickAdd({ ...quickAdd, name: e.target.value })}
-                />
+                <div className="pt-combo">
+                  <input
+                    autoFocus
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-expanded={showList}
+                    aria-controls={`pt-suggest-${g.kind}`}
+                    aria-activedescendant={showList && activeIndex >= 0 ? `pt-suggest-${g.kind}-${activeIndex}` : undefined}
+                    value={quickAdd.name}
+                    placeholder={`${KIND_LABEL[g.kind]}'s name`}
+                    onChange={(e) => setName(e.target.value)}
+                    onKeyDown={onQuickAddKey}
+                    onFocus={() => setListOpen(true)}
+                    onBlur={() => setListOpen(false)}
+                  />
+                  {showList && (
+                    <ul className="pt-suggest" role="listbox" id={`pt-suggest-${g.kind}`}>
+                      {matches.map((m, i) => {
+                        const meta = [relationLabel(props.egoId, m.id, people, relationships), personMeta(m)]
+                          .filter(Boolean)
+                          .join(" · ");
+                        return (
+                          <li
+                            key={m.id}
+                            id={`pt-suggest-${g.kind}-${i}`}
+                            role="option"
+                            aria-selected={i === activeIndex}
+                            onMouseDown={(e) => e.preventDefault()}
+                            onMouseEnter={() => setActiveIndex(i)}
+                            onClick={() => pick(i)}
+                          >
+                            <strong>{m.displayName}</strong>
+                            {meta && <small>{meta}</small>}
+                          </li>
+                        );
+                      })}
+                      <li
+                        id={`pt-suggest-${g.kind}-${matches.length}`}
+                        role="option"
+                        className="pt-suggest-new"
+                        aria-selected={activeIndex === matches.length}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onMouseEnter={() => setActiveIndex(matches.length)}
+                        onClick={() => pick(matches.length)}
+                      >
+                        Add new &ldquo;{quickAdd.name.trim()}&rdquo;
+                      </li>
+                    </ul>
+                  )}
+                </div>
                 <button className="pt-btn pt-btn-primary pt-btn-small" disabled={!quickAdd.name.trim()}>
                   Add
                 </button>

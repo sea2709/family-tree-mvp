@@ -70,6 +70,8 @@ button { cursor: pointer; }
 .pt-btn-ghost.danger { color: var(--pt-danger); }
 .pt-btn-danger { background: var(--pt-danger); color: #fff; }
 .pt-btn-small { padding: 5px 10px; font-size: 13px; }
+.pt-btn-icon { display: inline-flex; align-items: center; gap: 6px; }
+.pt-btn-icon svg { flex-shrink: 0; }
 .pt-link { background: none; border: none; padding: 0; color: var(--green); font-size: 13px; font-weight: 600; text-decoration: none; }
 .pt-link:hover { text-decoration: underline; }
 .pt-icon-btn { background: none; border: none; font-size: 22px; line-height: 1; color: var(--muted); padding: 4px 8px; border-radius: 6px; }

@@ -12,6 +12,7 @@ import {
   relationLabel,
   type LayoutSize,
 } from "@/lib/tree";
+import { DownloadIcon, ResetIcon, UploadIcon, UserPlusIcon } from "./icons";
 import {
   applyProposalBatch,
   batchOf,
@@ -31,6 +32,7 @@ const CHAT_KEY = "family-tree-mvp-v1-chat";
 const LAYOUT_KEY = "family-tree-mvp-v1-layout";
 const SNAP = 8;
 const EXAMPLE = "I'm Lan. My dad is Minh, born 1960 in Hanoi. He married my mom, Hoa.";
+const FRESH_WELCOME = "Hi! Let's start with you. Tell me your name, then your parents — like the example below.";
 const SIZE: LayoutSize = { nodeW: 184, nodeH: 64, hGap: 24, vGap: 64 };
 const PAD = 32;
 const MIN_ZOOM = 0.4;
@@ -138,6 +140,7 @@ export default function Home() {
   const [quickAdd, setQuickAdd] = useState<QuickAdd | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [recentIds, setRecentIds] = useState<Set<string>>(new Set());
@@ -200,7 +203,7 @@ export default function Home() {
               text:
                 savedPeople.length > 0
                   ? `Welcome back — your tree has ${savedPeople.length} ${savedPeople.length === 1 ? "person" : "people"}. Tell me about someone new, or click a person to edit them.`
-                  : "Hi! Let's start with you. Tell me your name, then your parents — like the example below.",
+                  : FRESH_WELCOME,
             },
           ]
     );
@@ -267,13 +270,14 @@ export default function Home() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (pendingImport) setPendingImport(null);
+      else if (confirmReset) setConfirmReset(false);
       else if (showAdd) setShowAdd(false);
       else if (quickAdd) setQuickAdd(null);
       else setSelectedId(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [pendingImport, showAdd, quickAdd]);
+  }, [pendingImport, confirmReset, showAdd, quickAdd]);
 
   useEffect(() => {
     setQuickAdd(null);
@@ -672,6 +676,35 @@ export default function Home() {
       onUndo: () => {
         commit(before, null);
         setManualPos(beforeLayout);
+      },
+    });
+  }
+
+  function resetTree() {
+    const before = snapshot();
+    const beforeLayout = manualPos;
+    const beforeMessages = messages;
+    const beforeModelNote = modelNote;
+    commit({ people: [], relationships: [], egoId: null, proposals: [], resolvedRefs: {} }, null);
+    setManualPos({});
+    setMessages([{ id: uid(), role: "assistant", text: FRESH_WELCOME }]);
+    setModelNote(null);
+    setSelectedId(null);
+    setQuickAdd(null);
+    setSameAs({});
+    setUnchecked(new Set());
+    setConfirmReset(false);
+    setInput("");
+    setRefit((n) => n + 1);
+    setMobileTab("chat");
+    showToast({
+      label: "Tree reset",
+      onUndo: () => {
+        commit(before, null);
+        setManualPos(beforeLayout);
+        setMessages(beforeMessages);
+        setModelNote(beforeModelNote);
+        setRefit((n) => n + 1);
       },
     });
   }
@@ -1139,18 +1172,20 @@ export default function Home() {
         <span className="pt-saved">Saved in this browser</span>
         <div className="pt-header-actions">
           <button
-            className="pt-btn pt-btn-ghost"
+            className="pt-btn pt-btn-ghost pt-btn-icon"
             onClick={exportTree}
             disabled={people.length === 0}
             title="Download your tree as a file you can import later"
           >
+            <DownloadIcon />
             Export
           </button>
           <button
-            className="pt-btn pt-btn-ghost"
+            className="pt-btn pt-btn-ghost pt-btn-icon"
             onClick={() => importInputRef.current?.click()}
             title="Load a tree from an exported file"
           >
+            <UploadIcon />
             Import
           </button>
           <input
@@ -1160,8 +1195,18 @@ export default function Home() {
             hidden
             onChange={(e) => void pickImport(e.currentTarget)}
           />
-          <button className="pt-btn pt-btn-secondary" onClick={() => setShowAdd(true)}>
-            + Person
+          <button
+            className="pt-btn pt-btn-ghost pt-btn-icon"
+            onClick={() => setConfirmReset(true)}
+            disabled={loading || (people.length === 0 && proposals.length === 0)}
+            title="Clear everyone and start a new tree"
+          >
+            <ResetIcon />
+            Reset
+          </button>
+          <button className="pt-btn pt-btn-secondary pt-btn-icon" onClick={() => setShowAdd(true)}>
+            <UserPlusIcon />
+            Person
           </button>
         </div>
         <div className="pt-tabs" role="tablist">
@@ -1354,6 +1399,14 @@ export default function Home() {
           fileName={pendingImport.name}
           onCancel={() => setPendingImport(null)}
           onConfirm={() => applyImport(pendingImport.file, pendingImport.name)}
+        />
+      )}
+
+      {confirmReset && (
+        <ResetConfirmDialog
+          current={people.length}
+          onCancel={() => setConfirmReset(false)}
+          onConfirm={resetTree}
         />
       )}
 
@@ -1595,6 +1648,29 @@ function ImportConfirmDialog(props: {
           </button>
           <button type="button" className="pt-btn pt-btn-danger" onClick={props.onConfirm}>
             Replace
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResetConfirmDialog(props: { current: number; onCancel: () => void; onConfirm: () => void }) {
+  const plural = (n: number) => `${n} ${n === 1 ? "person" : "people"}`;
+  return (
+    <div className="pt-overlay" onMouseDown={(e) => e.target === e.currentTarget && props.onCancel()}>
+      <div className="pt-dialog" role="dialog" aria-label="Reset your tree">
+        <h2>Reset your tree?</h2>
+        <p>
+          All {plural(props.current)}, their links, your layout, pending suggestions and the chat history will be
+          cleared. You can undo right after — or Export first to keep a copy.
+        </p>
+        <div className="pt-row end">
+          <button type="button" className="pt-btn pt-btn-ghost" autoFocus onClick={props.onCancel}>
+            Cancel
+          </button>
+          <button type="button" className="pt-btn pt-btn-danger" onClick={props.onConfirm}>
+            Reset
           </button>
         </div>
       </div>

@@ -123,7 +123,9 @@ draggable/zoomable tree, relationship labels, person details,
 bio/story editing, avatar upload (resized, stored as a data URL),
 photo galleries for the family and each person (IndexedDB), manual
 add/edit/delete, localStorage persistence (tree, chat history, and
-card positions).
+card positions), and JSON export/import of the tree (people, links,
+avatars, stories, and card positions) via the Export / Import buttons
+in the header.
 
 Out (for later): user accounts and sharing, a real database,
 React Flow, GEDCOM import/export, voice recording, AI avatar

@@ -5,6 +5,7 @@ import type {
   RosterPerson,
   RosterRelationship,
 } from "./types";
+import { monthNumber, toIsoDate } from "./dates";
 
 export type ExtractResult = {
   reply: string;
@@ -83,6 +84,51 @@ function splitNameList(text: string): string[] {
     .split(/\s*,\s*(?:and\s+)?(?![^(]*\))|\s+and\s+(?![^(]*\))|\s*&\s*/i)
     .map(trimName)
     .filter((n) => /^\p{Lu}/u.test(n));
+}
+
+// "born 1960 in Hanoi", "born on 5 March 1960", "born March 5th, 1960",
+// "born 1960-03-05". A full date only when day, month and year are all
+// there; numeric "05/03/1960" is skipped because the day/month order
+// is ambiguous.
+function parseBorn(
+  sentence: string
+): { year: number; date: string | null; place: string | null; circa: boolean } | null {
+  const lead = /\bborn\s+(?:on\s+)?(?:the\s+)?(?:in\s+)?(around\s+|about\s+|circa\s+|c\.\s*)?(?:in\s+)?/i;
+  const start = sentence.match(lead);
+  if (!start || start.index == null) return null;
+  const rest = sentence.slice(start.index + start[0].length);
+  const placeTail = /(?:\s+in\s+([A-Za-z][A-Za-z\s.'-]*?))?(?:[.,]|$)/.source;
+  const ord = "(?:st|nd|rd|th)?";
+  const forms: { re: RegExp; pick: (m: RegExpMatchArray) => [number, number | null, number | null] }[] = [
+    {
+      re: new RegExp(`^(\\d{4})-(\\d{1,2})-(\\d{1,2})${placeTail}`, "i"),
+      pick: (m) => [Number(m[1]), Number(m[2]), Number(m[3])],
+    },
+    {
+      re: new RegExp(`^(\\d{1,2})${ord}\\s+(?:of\\s+)?([A-Za-z]{3,9}\\.?)\\s*,?\\s+(\\d{4})${placeTail}`, "i"),
+      pick: (m) => [Number(m[3]), monthNumber(m[2]), Number(m[1])],
+    },
+    {
+      re: new RegExp(`^([A-Za-z]{3,9}\\.?)\\s+(\\d{1,2})${ord}\\s*,?\\s+(\\d{4})${placeTail}`, "i"),
+      pick: (m) => [Number(m[3]), monthNumber(m[1]), Number(m[2])],
+    },
+    {
+      re: new RegExp(`^(\\d{4})${placeTail}`, "i"),
+      pick: (m) => [Number(m[1]), null, null],
+    },
+  ];
+  for (const { re, pick } of forms) {
+    const m = rest.match(re);
+    if (!m) continue;
+    const [year, month, day] = pick(m);
+    // A month name that isn't one ("born Tuesday 5, 1960") is not a date.
+    if (month === null && day !== null) continue;
+    if (!Number.isFinite(year) || year < 1800 || year > 2100) return null;
+    const date = month && day ? toIsoDate(year, month, day) : null;
+    const place = m[m.length - 1] ? cleanName(m[m.length - 1]) : null;
+    return { year, date, place, circa: !!start[1] };
+  }
+  return null;
 }
 
 function titleCaseName(name: string): string {
@@ -466,20 +512,16 @@ export function extractFallback(
 
   const attachBirth = (sentence: string, ref: string | null) => {
     if (!ref) return;
-    const born = sentence.match(
-      /\bborn\s+(?:in\s+)?(?:around\s+|about\s+|circa\s+|c\.\s*)?(?:in\s+)?(\d{4})(?:\s+in\s+([A-Za-z][A-Za-z\s.'-]*?))?(?:[.,]|$)/iu
-    );
+    const born = parseBorn(sentence);
     if (!born) return;
-    const year = Number(born[1]);
-    if (!Number.isFinite(year) || year < 1800 || year > 2100) return;
-    const place = born[2] ? cleanName(born[2]) : null;
     const proposal =
       proposals.find((p) => p.kind === "person" && p.tempId === ref) ??
       (roster.some((r) => r.id === ref) ? updateFor(ref, sentence) : undefined);
     if (proposal) {
-      proposal.birthYear = year;
-      if (place) proposal.birthPlace = place;
-      if (/\bborn\s+(?:in\s+)?(?:around|about|circa|c\.)/i.test(sentence)) proposal.confidence = "low";
+      proposal.birthYear = born.year;
+      if (born.date) proposal.birthDate = born.date;
+      if (born.place) proposal.birthPlace = born.place;
+      if (born.circa) proposal.confidence = "low";
     }
   };
 
@@ -865,12 +907,11 @@ export function extractFallback(
       lastName = name;
     }
 
-    // 6. Standalone birth fact: "Minh, born 1960 in Hanoi"
+    // 6. Standalone birth fact: "Minh, born 1960 in Hanoi" /
+    //    "Minh, born on 5 March 1960"
     if (!sentenceRef) {
-      const standalone = sentence.match(
-        /^(\p{L}[\p{L}' -]+?),\s*born\s+\d{4}/iu
-      );
-      if (standalone) {
+      const standalone = sentence.match(/^(\p{L}[\p{L}' -]+?),\s*born\s/iu);
+      if (standalone && parseBorn(sentence)) {
         const name = trimName(standalone[1]);
         const ref = getOrCreate(name, sentence, "medium");
         sentenceRef = ref;
@@ -883,9 +924,16 @@ export function extractFallback(
     // or (for "He was born in 1960...") to the last-mentioned person.
     // "My dad was born in 1960" with no name must not land on whoever
     // happened to be mentioned last.
-    let birthRef = sentenceRef;
+    let birthRef: string | null = sentenceRef;
     if (!birthRef && /^(he|she)\b/i.test(sentence)) birthRef = lastRef;
     if (!birthRef && /^i\b/i.test(sentence)) birthRef = egoRef;
+    // "Minh was born on 5 March 1960": only someone already named.
+    const namedBorn = birthRef ? null : sentence.match(/^(\p{L}[\p{L}' -]*?)\s+was\s+born\b/iu);
+    if (namedBorn) {
+      const name = trimName(namedBorn[1]);
+      birthRef = findRoster(name)?.id ?? tempByName.get(name.toLowerCase()) ?? null;
+      if (birthRef) sentenceRef = birthRef;
+    }
     attachBirth(sentence, birthRef);
 
     // "He is younger than me 2 years" / "Thuc is 2 years younger than
@@ -957,6 +1005,7 @@ export function extractFallback(
     const changes =
       (p.displayName && p.displayName !== existing.displayName) ||
       (p.birthYear != null && p.birthYear !== existing.birthYear) ||
+      (p.birthDate && p.birthDate !== existing.birthDate) ||
       (p.birthPlace && p.birthPlace !== existing.birthPlace);
     if (!changes) {
       proposals.splice(i, 1);

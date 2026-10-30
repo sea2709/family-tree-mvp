@@ -6,12 +6,14 @@ import type {
   RosterRelationship,
 } from "@/lib/types";
 import { extractFallback } from "@/lib/extract-fallback";
+import { birthLabel, isIsoDate, yearOf } from "@/lib/dates";
 
 const SYSTEM_PROMPT = `You extract family-tree facts from ONE chat message. You do NOT chat freely.
 
 Rules:
 - Only extract what is EXPLICITLY stated in this message. Never invent a date, place, spelling, or relationship.
 - If a value is vague ("around 1960", "in the 60s"), keep the year and set the proposal confidence to "low". Do not make it exact.
+- When the full birth date is stated ("born on 5 March 1960", "born 1960-03-05"), set "birthDate" as "YYYY-MM-DD" and "birthYear" to its year. Only set birthDate when day, month AND year are all given; never fill in a missing day or month. A numeric date like "05/03/1960" is ambiguous (day/month order), so keep only the year and ask in the reply which order they meant.
 - Relative ages ARE stated facts, not guesses: "he is 2 years younger than me" / "younger than me 2 years" / "I am 3 years older than Thuc". When one side's birth year is given (in this message or in the roster), compute the other side's birth year and emit a person update for them too (the speaker included — use the speaker's roster id as tempId). E.g. Thuc born 1990 and "he is younger than me 2 years" means the speaker was born in 1988. Set that proposal's confidence to "medium" and put the arithmetic in "reason", e.g. "Worked out from: Thuc born 1990, 2 years younger than you".
 - Never merge two people with the same name. If a name could be an existing person from the roster or a new person, prefer the existing roster id ONLY on an exact case-insensitive name match; otherwise use a new tempId and set confidence to "low".
 - Resolve relative words ONLY if unambiguous: "my dad" = parent of the speaker, "my mom" = parent of the speaker. "My uncle", "my aunt", "my cousin" are AMBIGUOUS — do not guess a link; return a person proposal at most, and ask in the reply which side of the family they are on.
@@ -30,7 +32,7 @@ Rules:
   "reply": "a short friendly summary of what you think you heard, and what to confirm. Nothing is in the tree until the user accepts, so never say you added or saved anything; say what you propose instead",
   "proposals": [
     { "id": "p0", "kind": "person", "tempId": "temp-lan", "displayName": "Lan", "isSpeaker": true, "reason": "You said: \\"I'm Lan\\"", "confidence": "high" },
-    { "id": "p1", "kind": "person", "tempId": "temp-minh", "displayName": "Minh", "birthYear": 1960, "birthPlace": "Hanoi", "reason": "You said: \\"...\\"", "confidence": "high" },
+    { "id": "p1", "kind": "person", "tempId": "temp-minh", "displayName": "Minh", "birthYear": 1960, "birthDate": "1960-03-05", "birthPlace": "Hanoi", "reason": "You said: \\"...\\"", "confidence": "high" },
     { "id": "p2", "kind": "relationship", "fromRef": "temp-minh", "toRef": "<existing person id or tempId>", "relationshipType": "PARENT_OF", "reason": "You said: \\"...\\"", "confidence": "high" }
   ]
 }
@@ -69,7 +71,8 @@ function logProposals(modelUsed: string, proposals: Proposal[]) {
   for (const p of proposals) {
     if (p.kind === "person") {
       const aka = p.preferredName ? ` (${p.preferredName})` : "";
-      const born = p.birthYear ? ` b.${p.birthYear}${p.birthPlace ? ` ${p.birthPlace}` : ""}` : "";
+      const label = birthLabel(p);
+      const born = label ? ` b.${label}${p.birthPlace ? ` ${p.birthPlace}` : ""}` : "";
       log(`  + person ${p.displayName}${aka}${born} [${p.confidence}]`);
     } else {
       log(`  + ${nameOf(p.fromRef)} ${p.relationshipType} ${nameOf(p.toRef)} [${p.confidence}]`);
@@ -105,13 +108,15 @@ function normalizeProposals(
           : undefined;
     // Updates to an existing person often carry only the changed fields.
     const rosterName = tempId ? roster.find((r) => r.id === tempId)?.displayName : undefined;
+    const birthDate = isIsoDate(p.birthDate) ? p.birthDate : null;
     out.push({
       id: typeof p.id === "string" && p.id ? p.id : `ollama-${i}`,
       kind: p.kind,
       tempId,
       displayName: typeof p.displayName === "string" && p.displayName.trim() ? p.displayName : rosterName,
       preferredName: typeof p.preferredName === "string" ? p.preferredName : null,
-      birthYear: typeof p.birthYear === "number" ? p.birthYear : null,
+      birthYear: (birthDate ? yearOf(birthDate) : null) ?? (typeof p.birthYear === "number" ? p.birthYear : null),
+      birthDate,
       birthPlace: typeof p.birthPlace === "string" ? p.birthPlace : null,
       bio: typeof p.bio === "string" ? p.bio : null,
       gender: p.gender === "male" || p.gender === "female" ? p.gender : null,
@@ -235,7 +240,8 @@ function buildUserPrompt(
       ? roster
           .map((p) => {
             const aka = p.preferredName && p.preferredName !== p.displayName ? ` (${p.preferredName})` : "";
-            const born = p.birthYear ? `, born ${p.birthYear}` : "";
+            const label = birthLabel(p);
+            const born = label ? `, born ${label}` : "";
             const place = p.birthPlace ? ` in ${p.birthPlace}` : "";
             const relation = relationToEgo(p.id, egoId, rels, roster);
             const gender = p.gender ? `, ${p.gender}` : "";
@@ -250,7 +256,7 @@ function buildUserPrompt(
           .join("\n")
       : "- (none yet)";
   return [
-    `Existing people (roster: id, name (preferred name), birth year/place if known, relation to speaker):`,
+    `Existing people (roster: id, name (preferred name), birth date or year/place if known, relation to speaker):`,
     people,
     ``,
     `Known relationships already in the tree (do NOT propose these again):`,

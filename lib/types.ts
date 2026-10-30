@@ -3,6 +3,8 @@ export type Person = {
   displayName: string;
   preferredName?: string | null;
   birthYear?: number | null;
+  // Full date as "YYYY-MM-DD". When set, birthYear is its year.
+  birthDate?: string | null;
   birthDatePrecision?: "exact" | "year_only" | "circa" | "unknown";
   birthPlace?: string | null;
   deathYear?: number | null;
@@ -41,6 +43,7 @@ export type Proposal = {
   displayName?: string;
   preferredName?: string | null;
   birthYear?: number | null;
+  birthDate?: string | null;
   birthPlace?: string | null;
   bio?: string | null;
   gender?: Gender | null;
@@ -67,7 +70,7 @@ export type ChatMessage = {
 
 export type RosterPerson = Pick<
   Person,
-  "id" | "displayName" | "preferredName" | "birthYear" | "birthPlace" | "gender"
+  "id" | "displayName" | "preferredName" | "birthYear" | "birthDate" | "birthPlace" | "gender"
 >;
 
 // What the page sends to /api/chat alongside the roster: the edges

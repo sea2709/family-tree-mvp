@@ -230,6 +230,8 @@ button { cursor: pointer; }
 }
 .pt-fields input:focus, .pt-fields select:focus, .pt-fields textarea:focus, .pt-quick-add input:focus { outline: 2px solid var(--marigold-soft); border-color: var(--marigold); }
 .pt-fields textarea { min-height: 80px; resize: vertical; }
+.pt-fields input { min-width: 0; }
+.pt-fields input[readonly] { background: var(--paper); color: var(--muted); }
 
 .pt-family-group { padding: 8px 0; border-bottom: 1px dashed var(--line); }
 .pt-family-group:last-child { border-bottom: none; }

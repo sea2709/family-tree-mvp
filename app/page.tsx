@@ -23,6 +23,7 @@ import {
   uid,
   type TreeState,
 } from "@/lib/proposals";
+import { birthLabel, yearOf } from "@/lib/dates";
 
 const STORAGE_KEY = "family-tree-mvp-v1";
 const CHAT_KEY = "family-tree-mvp-v1-chat";
@@ -52,8 +53,9 @@ function modelLabel(note: string | null): string {
   return "Offline parser";
 }
 
-function personMeta(p: Pick<Person, "birthYear" | "birthPlace">): string {
-  return [p.birthYear ? `b. ${p.birthYear}` : null, p.birthPlace].filter(Boolean).join(" · ");
+function personMeta(p: Pick<Person, "birthYear" | "birthDate" | "birthPlace">): string {
+  const born = birthLabel(p);
+  return [born ? `b. ${born}` : null, p.birthPlace].filter(Boolean).join(" · ");
 }
 
 function relativeEdges(
@@ -332,6 +334,7 @@ export default function Home() {
         id,
         displayName: p.displayName,
         birthYear: p.birthYear ?? null,
+        birthDate: p.birthDate ?? null,
         birthPlace: p.birthPlace ?? null,
         gender: p.gender ?? null,
       });
@@ -417,6 +420,7 @@ export default function Home() {
         displayName: p.displayName,
         preferredName: p.preferredName ?? null,
         birthYear: p.birthYear ?? null,
+        birthDate: p.birthDate ?? null,
         birthPlace: p.birthPlace ?? null,
         gender: p.gender ?? null,
       }));
@@ -526,7 +530,7 @@ export default function Home() {
   function addRelative(
     anchorId: string | null,
     kind: RelativeKind,
-    fields: Pick<Person, "displayName" | "birthYear" | "birthPlace">,
+    fields: Pick<Person, "displayName" | "birthYear" | "birthDate" | "birthPlace">,
     coParentId: string | null = null
   ) {
     const before = snapshot();
@@ -649,6 +653,41 @@ export default function Home() {
     setDrag(null);
   }
 
+  // Arrows move focus between people: up to a parent, down to a child,
+  // left/right along the same row. Alt+arrows nudge the card instead.
+  function onNodeKeyDown(e: React.KeyboardEvent, p: (typeof positioned)[number]) {
+    if (!e.key.startsWith("Arrow") || e.ctrlKey || e.metaKey) return;
+    // Otherwise the scroll container eats the arrow and pans the canvas.
+    e.preventDefault();
+    if (e.altKey) {
+      nudge(e, p);
+      return;
+    }
+    const target = neighbourOf(p, e.key);
+    if (target) {
+      canvasRef.current?.querySelector<HTMLElement>(`[data-id="${CSS.escape(target)}"]`)?.focus();
+    }
+  }
+
+  function neighbourOf(p: (typeof positioned)[number], key: string): string | null {
+    const candidates = positioned.filter((c) => c.id !== p.id && !preview.pendingIds.has(c.id));
+    const closestByX = (list: typeof candidates) =>
+      list.reduce<(typeof candidates)[number] | null>(
+        (best, c) => (!best || Math.abs(c.x - p.x) < Math.abs(best.x - p.x) ? c : best),
+        null
+      )?.id ?? null;
+    if (key === "ArrowUp" || key === "ArrowDown") {
+      const related = new Set(
+        (key === "ArrowUp" ? getParents : getChildren)(p.id, allPeople, allRels).map((r) => r.id)
+      );
+      return closestByX(candidates.filter((c) => related.has(c.id)));
+    }
+    const dir = key === "ArrowRight" ? 1 : -1;
+    return closestByX(
+      candidates.filter((c) => Math.abs(c.y - p.y) < SIZE.nodeH && (c.x - p.x) * dir > 0)
+    );
+  }
+
   function nudge(e: React.KeyboardEvent, p: Point & { id: string }) {
     const step = e.shiftKey ? SNAP * 5 : SNAP;
     const delta: Record<string, Point> = {
@@ -659,7 +698,6 @@ export default function Home() {
     };
     const d = delta[e.key];
     if (!d || preview.pendingIds.has(p.id)) return;
-    e.preventDefault();
     setManualPos((prev) => ({ ...prev, [p.id]: { x: Math.max(0, p.x + d.x), y: Math.max(0, p.y + d.y) } }));
   }
 
@@ -756,7 +794,11 @@ export default function Home() {
                           {label && <span className="pt-tag">{label}</span>}
                         </span>
                         <span className="pt-review-meta">
-                          {personMeta({ birthYear: p.birthYear ?? null, birthPlace: p.birthPlace ?? null }) ||
+                          {personMeta({
+                            birthYear: p.birthYear ?? null,
+                            birthDate: p.birthDate ?? null,
+                            birthPlace: p.birthPlace ?? null,
+                          }) ||
                             (existing ? "No new details" : "New person")}
                         </span>
                       </span>
@@ -840,7 +882,7 @@ export default function Home() {
         onPointerMove={onNodePointerMove}
         onPointerUp={onNodePointerUp}
         onPointerCancel={onNodePointerCancel}
-        onKeyDown={(e) => nudge(e, p)}
+        onKeyDown={(e) => onNodeKeyDown(e, p)}
         onClick={() => {
           if (suppressClick.current) {
             suppressClick.current = false;
@@ -851,7 +893,7 @@ export default function Home() {
         title={
           pending
             ? `${p.displayName} — waiting for your review in chat`
-            : `${p.displayName} — drag to move, or use arrow keys`
+            : `${p.displayName} — arrow keys move between people; drag or Alt+arrow keys to move this card`
         }
       >
         {p.avatarUrl ? (
@@ -863,7 +905,7 @@ export default function Home() {
         <span className="pt-node-text">
           <span className="pt-node-name">{p.displayName}</span>
           <span className="pt-node-meta">
-            {[pending ? "New" : label, p.birthYear ? `b. ${p.birthYear}` : null].filter(Boolean).join(" · ")}
+            {[pending ? "New" : label, birthLabel(p) ? `b. ${birthLabel(p)}` : null].filter(Boolean).join(" · ")}
           </span>
         </span>
       </button>
@@ -1023,7 +1065,7 @@ export default function Home() {
                 {preview.pendingIds.size > 0 && (
                   <span><i className="lg pending" /> Waiting for review</span>
                 )}
-                <span>Drag cards to rearrange</span>
+                <span>Drag or Alt+arrows to rearrange</span>
               </div>
             </>
           )}
@@ -1154,11 +1196,24 @@ function PersonDrawer(props: {
             />
           </label>
           <label>
+            Birth date
+            <input
+              type="date"
+              value={person.birthDate ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                props.onPatch(v ? { birthDate: v, birthYear: yearOf(v) } : { birthDate: null });
+              }}
+            />
+          </label>
+          <label>
             Birth year
             <input
               inputMode="numeric"
               value={person.birthYear ?? ""}
               placeholder="1960"
+              readOnly={!!person.birthDate}
+              title={person.birthDate ? "Set by the birth date — clear it to edit the year alone" : undefined}
               onChange={(e) => {
                 const v = e.target.value.replace(/\D/g, "").slice(0, 4);
                 props.onPatch({ birthYear: v ? Number(v) : null });
@@ -1176,7 +1231,7 @@ function PersonDrawer(props: {
               <option value="male">Male</option>
             </select>
           </label>
-          <label className="wide">
+          <label>
             Birthplace
             <input
               value={person.birthPlace ?? ""}
@@ -1273,12 +1328,13 @@ function AddPersonDialog(props: {
   defaultAnchor: string | null;
   onClose: () => void;
   onAdd: (
-    fields: Pick<Person, "displayName" | "birthYear" | "birthPlace">,
+    fields: Pick<Person, "displayName" | "birthYear" | "birthDate" | "birthPlace">,
     anchorId: string | null,
     kind: RelativeKind
   ) => void;
 }) {
   const [name, setName] = useState("");
+  const [date, setDate] = useState("");
   const [year, setYear] = useState("");
   const [place, setPlace] = useState("");
   const [anchor, setAnchor] = useState(props.defaultAnchor ?? "");
@@ -1288,7 +1344,12 @@ function AddPersonDialog(props: {
     e.preventDefault();
     if (!name.trim()) return;
     props.onAdd(
-      { displayName: name.trim(), birthYear: year ? Number(year) : null, birthPlace: place.trim() || null },
+      {
+        displayName: name.trim(),
+        birthYear: year ? Number(year) : null,
+        birthDate: date || null,
+        birthPlace: place.trim() || null,
+      },
       anchor || null,
       kind
     );
@@ -1304,15 +1365,27 @@ function AddPersonDialog(props: {
             <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Nguyen Van Minh" />
           </label>
           <label>
+            Birth date
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => {
+                setDate(e.target.value);
+                if (e.target.value) setYear(String(yearOf(e.target.value) ?? ""));
+              }}
+            />
+          </label>
+          <label>
             Birth year
             <input
               inputMode="numeric"
               value={year}
+              readOnly={!!date}
               onChange={(e) => setYear(e.target.value.replace(/\D/g, "").slice(0, 4))}
               placeholder="Optional"
             />
           </label>
-          <label>
+          <label className="wide">
             Birthplace
             <input value={place} onChange={(e) => setPlace(e.target.value)} placeholder="Optional" />
           </label>

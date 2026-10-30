@@ -1,4 +1,5 @@
 import type { Person, Proposal, Relationship } from "./types";
+import { birthLabel, isIsoDate, yearOf } from "./dates";
 
 export function uid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -85,7 +86,8 @@ export function describeProposal(
       bits.push(name);
     }
     if (p.preferredName && p.preferredName !== name) bits.push(`(${p.preferredName})`);
-    if (p.birthYear) bits.push(`born ${p.birthYear}`);
+    const born = birthLabel(p);
+    if (born) bits.push(`born ${born}`);
     if (p.birthPlace) bits.push(`in ${p.birthPlace}`);
     if (existing) return `Update ${existing.displayName}: ${bits.join(" ")}`;
     return `Add person: ${bits.join(" ")}`;
@@ -140,15 +142,21 @@ export function applyProposalBatch(
     let id: string | null = null;
     const targetId = p.existingPersonId ?? p.tempId;
     const target = targetId ? nextPeople.find((x) => x.id === targetId) : undefined;
+    const birthDate = isIsoDate(p.birthDate) ? p.birthDate : null;
+    const birthYear = (birthDate ? yearOf(birthDate) : null) ?? p.birthYear ?? null;
     if (target) {
       const displayName = p.existingPersonId ? target.displayName : p.displayName ?? target.displayName;
+      // A new year that contradicts the stored date drops the date.
+      const keptDate =
+        target.birthDate && (birthYear == null || yearOf(target.birthDate) === birthYear) ? target.birthDate : null;
       const updated: Person = {
         ...target,
         displayName,
         preferredName:
           (p.existingPersonId ? null : p.preferredName) ??
           (target.preferredName || (target.displayName !== displayName ? target.displayName : null)),
-        birthYear: p.birthYear ?? target.birthYear ?? null,
+        birthYear: birthYear ?? target.birthYear ?? null,
+        birthDate: birthDate ?? keptDate,
         birthPlace: p.birthPlace ?? target.birthPlace ?? null,
         bio: p.bio ?? target.bio ?? null,
         gender: target.gender ?? p.gender ?? null,
@@ -160,7 +168,8 @@ export function applyProposalBatch(
         id: uid(),
         displayName: p.displayName,
         preferredName: p.preferredName ?? null,
-        birthYear: p.birthYear ?? null,
+        birthYear,
+        birthDate,
         birthPlace: p.birthPlace ?? null,
         bio: p.bio ?? null,
         gender: p.gender ?? null,

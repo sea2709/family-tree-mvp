@@ -545,9 +545,10 @@ export function extractFallback(
     let sentenceRef: string | null = null;
 
     // 1. Ego: "I'm Lan" / "I am Lan" / "My name is Lan"
-    // "I am married to Mai" / "I'm 35" / "I am the eldest" are not names.
+    // "I am married to Mai" / "I'm 35" / "I am the eldest" / "I am three
+    // years older than Thuc" are not names.
     const egoMatch = sentence.match(
-      /\b(?:i am|i'm|my name is)\s+(?!(?:married|engaged|divorced|the|a|an|also|from|born|not|now|still|their|his|her|your|older|younger|single)\b)(\p{L}[\p{L}' -]+?)(?:[.,]|$)/iu
+      /\b(?:i am|i'm|my name is)\s+(?!(?:married|engaged|divorced|the|a|an|also|from|born|not|now|still|their|his|her|your|older|younger|single)\b|(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+years?\b)(\p{L}[\p{L}' -]+?)(?:[.,]|$)/iu
     );
     if (egoMatch) {
       const name = trimName(egoMatch[1]);
@@ -1046,6 +1047,8 @@ export function extractFallback(
       "My dad is Minh” — so I know whose dad and mom they are.";
   } else if (proposals.length === 0 && alreadyKnown > 0) {
     reply = "That's already in your tree, so there's nothing new to add. Tell me about someone else!";
+  } else if (proposals.length === 0 && clarifyNote) {
+    reply = clarifyNote;
   } else if (proposals.length === 0) {
     reply =
       "I couldn't pull a clear family fact from that. Could you try something like “My dad is Minh, born 1960 in Hanoi”? " +

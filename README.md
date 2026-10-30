@@ -83,6 +83,16 @@ If a large model (e.g. `gemma4:31b`) keeps timing out, raise
 The chat header shows which path was used for the last message
 (`ollama:gemma4:12b` vs `fallback`).
 
+### Checks
+
+```bash
+npm run typecheck   # tsc --noEmit
+npm run lint        # ESLint (next/core-web-vitals + next/typescript)
+npm test            # Vitest, tests live next to the code as *.test.ts
+npm run coverage    # Vitest + V8 coverage; HTML report in coverage/
+npm run check       # typecheck + lint + test
+```
+
 ## Architecture: chat → proposals → confirmation → tree
 
 1. **Chat** — the user talks naturally.
@@ -99,13 +109,20 @@ The chat header shows which path was used for the last message
    `SPOUSE_OF`/`PARTNER_OF`), labels everyone relative to the speaker
    ("Mother", "Sister-in-law"), and draws parent/child links as family
    bars. Cards can be dragged (positions are saved; "Tidy up" resets
-   them), and the canvas zooms and fits. Clicking a card opens a side
+   them). Dragging empty space or scrolling pans the canvas;
+   Ctrl/Cmd+wheel or a trackpad pinch zooms around the cursor, and
+   "Fit" zooms to show everyone. Clicking a card opens a side
    panel to edit details, the story, the avatar and photos, and to add
-   relatives.
+   relatives. The add-relative box suggests people already in the tree
+   as you type (accent-insensitive, so "Dang" finds "Đăng") and links
+   them instead of creating a duplicate. It hides anyone who would
+   become their own ancestor or give a child more than two parents.
 5. **Photos** — the "Photos" button opens a family-wide gallery, and
    each person's panel has their own. One photo can be tagged with
    several people, so a wedding photo shows up on everyone's page.
-   Uploads are resized (2000px long edge plus a 400px thumbnail) and
+   "Play slideshow" in the family gallery shows the current list full
+   screen with captions, year and tagged names; it advances every 5
+   seconds (Space pauses, arrows step, Escape exits). Uploads are resized (2000px long edge plus a 400px thumbnail) and
    stored in IndexedDB; only captions, years, and tags go in
    localStorage with the tree.
 
@@ -119,13 +136,17 @@ parents, linked as spouses.
 ## What is in this MVP — and what is deliberately not
 
 In: chat extraction, proposal review with tree preview and undo,
-draggable/zoomable tree, relationship labels, person details,
+draggable/pannable/zoomable tree, relationship labels, person details
+(including a preferred name, shown on the card as "Full Name (Short)"),
 bio/story editing, avatar upload (resized, stored as a data URL),
-photo galleries for the family and each person (IndexedDB), manual
-add/edit/delete, localStorage persistence (tree, chat history, and
-card positions), and JSON export/import of the tree (people, links,
-avatars, stories, and card positions) via the Export / Import buttons
-in the header.
+photo galleries for the family and each person (IndexedDB), a family
+photo slideshow with captions, manual
+add/edit/delete, linking existing people as relatives from the side
+panel, localStorage persistence (tree, chat history, and card
+positions), JSON export/import of the tree (people, links, avatars,
+stories, and card positions) via the Export / Import buttons in the
+header, and a Reset button that clears the tree, layout, pending
+suggestions and chat (with a confirmation and Undo).
 
 Out (for later): user accounts and sharing, a real database,
 React Flow, GEDCOM import/export, voice recording, AI avatar
@@ -142,8 +163,8 @@ generation, automatic duplicate merging, timeline view.
   Until then, photos live only in this browser and are not part of
   any export.
 - **Tree rendering:** the hand-rolled layout in `lib/tree.ts` plus
-  drag/zoom in `app/page.tsx` is enough for one family; swap to React
-  Flow for panning, minimaps, or very large trees.
+  drag/pan/zoom in `app/page.tsx` is enough for one family; swap to
+  React Flow for minimaps or very large trees.
 - **Extraction:** keep the proposal shape, but add more tool calls
   (update person, add story, ask clarification) and a proper agent
   framework such as Mastra or LangGraph for multi-turn memory.

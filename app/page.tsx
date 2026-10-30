@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMessage, Gender, Person, Photo, Proposal, Relationship } from "@/lib/types";
+import type { ChatMessage, ExtractionDebug, Gender, Person, Photo, Proposal, Relationship } from "@/lib/types";
 import {
   familyConnectors,
   getChildren,
@@ -28,7 +28,7 @@ import { birthLabel, yearOf } from "@/lib/dates";
 import { matchPeople, relativeCandidates, type RelativeKind } from "@/lib/people-search";
 import { resizeImage, shrinkImage } from "@/lib/images";
 import { deletePhotoBlobs, getPhotoBlob, isQuotaError, putPhotoBlobs, requestPersistence } from "@/lib/photo-store";
-import { PhotoGrid, PhotoViewer, TreeGalleryDialog } from "./photos";
+import { PhotoGrid, PhotoViewer, Slideshow, TreeGalleryDialog } from "./photos";
 import { MAX_FILE_BYTES, exportFileName, parseTreeFile, serializeTree, type TreeFile } from "@/lib/tree-file";
 
 const STORAGE_KEY = "family-tree-mvp-v1";
@@ -42,7 +42,7 @@ const PAD = 32;
 const MIN_ZOOM = 0.4;
 const MAX_ZOOM = 1.6;
 
-type Message = ChatMessage & { batchId?: string; tone?: "error" | "muted" };
+type Message = ChatMessage & { batchId?: string; tone?: "error" | "muted"; debug?: ExtractionDebug };
 type Toast = { label: string; onUndo?: () => void };
 type Point = { x: number; y: number };
 type DragState = { id: string; startX: number; startY: number; origin: Point; at: Point; moved: boolean };
@@ -61,6 +61,47 @@ function modelLabel(note: string | null): string {
   if (!note) return "Local AI or offline parser";
   if (note.startsWith("ollama:")) return `Local AI · ${note.slice("ollama:".length)}`;
   return "Offline parser";
+}
+
+function formatMs(ms?: number): string {
+  if (ms === undefined) return "?";
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+function DebugInfo({ debug }: { debug: ExtractionDebug }) {
+  const viaOllama = debug.source === "ollama";
+  const counts =
+    debug.returned !== undefined ? `${debug.kept} of ${debug.returned} kept` : `${debug.kept} proposal(s)`;
+  const summary = viaOllama
+    ? `Local AI · ${debug.model} · ${formatMs(debug.ollamaMs)} · ${counts}`
+    : `Fallback parser · ${counts} · Ollama: ${debug.ollamaError ?? "not used"}`;
+  const rows: [string, string | number | undefined][] = [
+    ["Source", viaOllama ? `ollama:${debug.model}` : "fallback (rule-based)"],
+    ["Ollama host", debug.host],
+    ["Ollama error", debug.ollamaError],
+    ["Ollama time", debug.ollamaMs !== undefined ? formatMs(debug.ollamaMs) : undefined],
+    ["Fallback time", debug.fallbackMs !== undefined ? formatMs(debug.fallbackMs) : undefined],
+    ["Total time", formatMs(debug.totalMs)],
+    ["Tokens", debug.promptTokens !== undefined ? `${debug.promptTokens} in / ${debug.outputTokens ?? "?"} out` : undefined],
+    ["Done reason", debug.doneReason],
+    ["Proposals", counts],
+  ];
+  return (
+    <details className={`pt-debug ${viaOllama ? "ollama" : "fallback"}`}>
+      <summary>{summary}</summary>
+      <dl>
+        {rows
+          .filter(([, v]) => v !== undefined && v !== "")
+          .map(([k, v]) => (
+            <div key={k}>
+              <dt>{k}</dt>
+              <dd>{v}</dd>
+            </div>
+          ))}
+      </dl>
+      {debug.rawOutput && <pre>{debug.rawOutput}</pre>}
+    </details>
+  );
 }
 
 function personMeta(p: Pick<Person, "birthYear" | "birthDate" | "birthPlace">): string {
@@ -105,6 +146,7 @@ export default function Home() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [showPhotos, setShowPhotos] = useState(false);
   const [viewPhotoId, setViewPhotoId] = useState<string | null>(null);
+  const [slideshowIds, setSlideshowIds] = useState<string[] | null>(null);
   // Which gallery is uploading: a person id, or "tree" for the family gallery.
   const [photoBusy, setPhotoBusy] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -267,6 +309,7 @@ export default function Home() {
       if (e.key !== "Escape") return;
       if (pendingImport) setPendingImport(null);
       else if (confirmReset) setConfirmReset(false);
+      else if (slideshowIds) setSlideshowIds(null);
       else if (viewPhotoId) setViewPhotoId(null);
       else if (showPhotos) setShowPhotos(false);
       else if (showAdd) setShowAdd(false);
@@ -275,7 +318,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [pendingImport, confirmReset, viewPhotoId, showPhotos, showAdd, quickAdd]);
+  }, [pendingImport, confirmReset, slideshowIds, viewPhotoId, showPhotos, showAdd, quickAdd]);
 
   useEffect(() => {
     setQuickAdd(null);
@@ -394,9 +437,6 @@ export default function Home() {
     const after = { ...next, proposals: rejectProposalBatch(next, dropped) };
     const added = after.people.filter((p) => !before.people.some((x) => x.id === p.id));
     const links = after.relationships.length - before.relationships.length;
-    // #region agent log
-    fetch('http://127.0.0.1:7308/ingest/3cf7ad3c-7927-4fa0-9b56-93e383e41bc7',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'896027'},body:JSON.stringify({sessionId:'896027',runId:'run1',hypothesisId:'B',location:'page.tsx:acceptBatch',message:'accept batch result',data:{items:items.length,chosen:chosen.length,chosenKinds:chosen.map((p)=>p.kind),chosenHaveName:chosen.map((p)=>!!p.displayName),dropped:dropped.length,added:added.length,links,skipped:skipped.length,peopleBefore:before.people.length,peopleAfter:after.people.length},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     commit(
       after,
       [
@@ -468,9 +508,6 @@ export default function Home() {
       const batch = Array.isArray(data.proposals)
         ? scopeBatch(data.proposals as Proposal[], people, prefix)
         : [];
-      // #region agent log
-      fetch('http://127.0.0.1:7308/ingest/3cf7ad3c-7927-4fa0-9b56-93e383e41bc7',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'896027'},body:JSON.stringify({sessionId:'896027',runId:'run1',hypothesisId:'A,B',location:'page.tsx:sendChat',message:'chat response',data:{status:res.status,rawProposals:Array.isArray(data.proposals)?data.proposals.length:typeof data.proposals,batch:batch.length,kinds:batch.map((p)=>p.kind),haveName:batch.map((p)=>!!p.displayName),confidences:batch.map((p)=>p.confidence),modelUsed:data.modelUsed},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       setMessages((m) => [
         ...m,
         {
@@ -483,6 +520,7 @@ export default function Home() {
                 ? "Here's what I understood — check it before it goes in the tree."
                 : "I didn't find anyone new in that. Try naming the person and how they're related to you.",
           batchId: batch.length ? prefix : undefined,
+          debug: data.debug && typeof data.debug === "object" ? (data.debug as ExtractionDebug) : undefined,
         },
       ]);
       if (batch.length) {
@@ -517,6 +555,13 @@ export default function Home() {
 
   const selected = people.find((p) => p.id === selectedId) ?? null;
   const viewingPhoto = photos.find((p) => p.id === viewPhotoId) ?? null;
+  const slideshowPhotos = useMemo(
+    () =>
+      slideshowIds
+        ? slideshowIds.map((id) => photos.find((p) => p.id === id)).filter((p): p is Photo => Boolean(p))
+        : null,
+    [slideshowIds, photos]
+  );
   const firstName = (p: Person) => p.preferredName || p.displayName.split(/\s+/).slice(-1)[0];
   const ego = people.find((p) => p.id === egoId) ?? null;
 
@@ -978,29 +1023,6 @@ export default function Home() {
   const height = (positioned.length ? Math.max(...positioned.map((p) => p.y)) + SIZE.nodeH : 0) + PAD * 2;
   const hoverNode = hoverId ? preview.proposalByNode.get(hoverId) ?? null : null;
 
-  // #region agent log
-  useEffect(() => {
-    const tree = document.querySelector(".pt-tree") as HTMLElement | null;
-    const main = document.querySelector(".pt-main") as HTMLElement | null;
-    const r = tree?.getBoundingClientRect();
-    const c = canvasRef.current?.getBoundingClientRect();
-    fetch('http://127.0.0.1:7308/ingest/3cf7ad3c-7927-4fa0-9b56-93e383e41bc7',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'896027'},body:JSON.stringify({sessionId:'896027',runId:'run1',hypothesisId:'A,B,C,E',location:'page.tsx:treeState',message:'tree render state',data:{loaded,viewportW:window.innerWidth,viewportH:window.innerHeight,mobileTab,mainClass:main?.className,treeDisplay:tree?getComputedStyle(tree).display:'NO_TREE_EL',treeRect:r?{w:r.width,h:r.height,x:r.x,y:r.y}:null,canvasRect:c?{w:c.width,h:c.height}:null,people:people.length,rels:relationships.length,pendingPeople:preview.pendingPeople.length,proposals:proposals.length,positioned:positioned.length,width,height,zoom,manualPosCount:Object.keys(manualPos).length,badPos:positioned.filter((p)=>!Number.isFinite(p.x)||!Number.isFinite(p.y)).length,nodesInDom:document.querySelectorAll('.pt-node').length,emptyShown:!!document.querySelector('.pt-empty')},timestamp:Date.now()})}).catch(()=>{});
-  }, [loaded, mobileTab, people.length, relationships.length, preview.pendingPeople.length, positioned.length, width, height, zoom, manualPos]);
-  useEffect(() => {
-    const onErr = (ev: ErrorEvent | PromiseRejectionEvent) => {
-      const msg = "message" in ev ? ev.message : String((ev as PromiseRejectionEvent).reason);
-      const stack = "error" in ev ? (ev.error as Error | undefined)?.stack?.slice(0, 800) : undefined;
-      fetch('http://127.0.0.1:7308/ingest/3cf7ad3c-7927-4fa0-9b56-93e383e41bc7',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'896027'},body:JSON.stringify({sessionId:'896027',runId:'run1',hypothesisId:'D',location:'page.tsx:windowError',message:'runtime error',data:{msg,stack},timestamp:Date.now()})}).catch(()=>{});
-    };
-    window.addEventListener("error", onErr);
-    window.addEventListener("unhandledrejection", onErr);
-    return () => {
-      window.removeEventListener("error", onErr);
-      window.removeEventListener("unhandledrejection", onErr);
-    };
-  }, []);
-  // #endregion
-
   function centerAt(z: number) {
     const el = canvasRef.current;
     if (!el) return;
@@ -1309,6 +1331,7 @@ export default function Home() {
             {messages.map((m) => (
               <div key={m.id} className="pt-msg-group">
                 <div className={`pt-msg ${m.role} ${m.tone ?? ""}`}>{m.text}</div>
+                {m.debug && <DebugInfo debug={m.debug} />}
                 {m.batchId && renderBatch(m.batchId)}
               </div>
             ))}
@@ -1489,6 +1512,7 @@ export default function Home() {
           busy={photoBusy === "tree"}
           onAdd={(files) => addPhotos(files, [])}
           onOpen={setViewPhotoId}
+          onPlay={setSlideshowIds}
           onClose={() => setShowPhotos(false)}
         />
       )}
@@ -1503,6 +1527,10 @@ export default function Home() {
           onDelete={() => deletePhoto(viewingPhoto.id)}
           onClose={() => setViewPhotoId(null)}
         />
+      )}
+
+      {slideshowPhotos && (
+        <Slideshow photos={slideshowPhotos} people={people} onClose={() => setSlideshowIds(null)} />
       )}
 
       {pendingImport && (

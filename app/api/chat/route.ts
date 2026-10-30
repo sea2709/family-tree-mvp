@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import type {
   ChatHistoryItem,
+  ExtractionDebug,
   Proposal,
   RosterPerson,
   RosterRelationship,
@@ -46,6 +47,10 @@ type OllamaProposal = Proposal & { [key: string]: unknown };
 // Messages, prompts and proposals contain family names and stories, so
 // they stay out of the hosting provider's logs in production.
 const LOG_CONTENT = process.env.NODE_ENV !== "production";
+const SEND_DEBUG = LOG_CONTENT || process.env.CHAT_DEBUG === "1";
+
+const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "gemma4:12b";
 
 function log(...args: unknown[]) {
   console.log(`[chat ${new Date().toISOString().slice(11, 23)}]`, ...args);
@@ -281,10 +286,17 @@ async function tryOllama(
   roster: RosterPerson[],
   rels: RosterRelationship[],
   egoId: string | null,
-  history: ChatHistoryItem[]
+  history: ChatHistoryItem[],
+  debug: ExtractionDebug
 ): Promise<{ reply: string; proposals: Proposal[]; modelUsed: string } | null> {
-  const host = process.env.OLLAMA_HOST || "http://localhost:11434";
-  const model = process.env.OLLAMA_MODEL || "gemma4:12b";
+  const host = OLLAMA_HOST;
+  const model = OLLAMA_MODEL;
+  const fail = (reason: string) => {
+    debug.ollamaError = reason;
+    debug.ollamaMs = Date.now() - started;
+    log(`ollama ✗ ${reason}`);
+    return null;
+  };
   // Required by Ollama Cloud (https://ollama.com); local Ollama needs none.
   const apiKey = process.env.OLLAMA_API_KEY;
   // Large local models (e.g. gemma4:31b) can need well over 90s for a
@@ -329,13 +341,16 @@ async function tryOllama(
             ? " (check OLLAMA_API_KEY)"
             : " (OLLAMA_API_KEY is not set)"
           : "";
-      log(`ollama ✗ HTTP ${res.status} after ${Date.now() - started}ms${authHint}: ${preview(errText)}`);
-      return null;
+      return fail(`HTTP ${res.status} after ${Date.now() - started}ms${authHint}: ${preview(errText)}`);
     }
     const data = await res.json();
     if (LOG_CONTENT) console.log(`ollama response: ${JSON.stringify(data)}`);
+    debug.ollamaMs = Date.now() - started;
+    if (typeof data?.prompt_eval_count === "number") debug.promptTokens = data.prompt_eval_count;
+    if (typeof data?.eval_count === "number") debug.outputTokens = data.eval_count;
+    if (typeof data?.done_reason === "string") debug.doneReason = data.done_reason;
     log(
-      `ollama ✓ responded in ${Date.now() - started}ms`,
+      `ollama ✓ responded in ${debug.ollamaMs}ms`,
       `(load ${nsToMs(data?.load_duration)},`,
       `prompt ${data?.prompt_eval_count ?? "?"} tok / ${nsToMs(data?.prompt_eval_duration)},`,
       `output ${data?.eval_count ?? "?"} tok / ${nsToMs(data?.eval_duration)},`,
@@ -344,18 +359,18 @@ async function tryOllama(
     const content = data?.message?.content;
     if (typeof content !== "string" || !content.trim()) {
       const thinkingLen = typeof data?.message?.thinking === "string" ? data.message.thinking.length : 0;
-      log(`ollama ✗ empty message content (thinking ${thinkingLen} chars, done_reason ${data?.done_reason ?? "?"})`);
-      return null;
+      return fail(`empty message content (thinking ${thinkingLen} chars, done_reason ${data?.done_reason ?? "?"})`);
     }
+    if (LOG_CONTENT) debug.rawOutput = content.slice(0, 8000);
     let parsed: { reply?: unknown; proposals?: unknown };
     try {
       parsed = JSON.parse(content);
     } catch {
-      log(`ollama ✗ invalid JSON${LOG_CONTENT ? `: ${preview(content, 300)}` : ""}`);
-      return null;
+      return fail(`invalid JSON${LOG_CONTENT ? `: ${preview(content, 300)}` : ""}`);
     }
     const rawCount = Array.isArray(parsed.proposals) ? parsed.proposals.length : 0;
     const proposals = normalizeProposals(parsed.proposals, roster, egoId);
+    debug.returned = rawCount;
     log(`ollama proposals: ${proposals.length} kept of ${rawCount} returned`);
     const reply =
       typeof parsed.reply === "string" && parsed.reply.trim()
@@ -365,18 +380,30 @@ async function tryOllama(
   } catch (err) {
     const elapsed = Date.now() - started;
     if (controller.signal.aborted) {
-      log(`ollama ✗ timed out after ${elapsed}ms`);
-    } else {
-      const cause = (err as { cause?: { code?: string } })?.cause?.code;
-      log(`ollama ✗ ${cause ?? (err as Error)?.message ?? err} after ${elapsed}ms (is Ollama running at ${host}?)`);
+      return fail(`timed out after ${elapsed}ms (OLLAMA_TIMEOUT_MS=${timeoutMs})`);
     }
-    return null;
+    const cause = (err as { cause?: { code?: string } })?.cause?.code;
+    return fail(`${cause ?? (err as Error)?.message ?? err} after ${elapsed}ms (is Ollama running at ${host}?)`);
   } finally {
     clearTimeout(timer);
   }
 }
 
 export async function POST(req: Request) {
+  const requestStarted = Date.now();
+  const debug: ExtractionDebug = {
+    source: "fallback",
+    model: OLLAMA_MODEL,
+    host: OLLAMA_HOST,
+    totalMs: 0,
+    kept: 0,
+  };
+  const respond = (payload: { reply: string; proposals: Proposal[]; modelUsed: string }) => {
+    if (!SEND_DEBUG) return NextResponse.json(payload);
+    debug.kept = payload.proposals.length;
+    debug.totalMs = Date.now() - requestStarted;
+    return NextResponse.json({ ...payload, debug });
+  };
   try {
     const body = await req.json().catch(() => ({}));
     const message = typeof body.message === "string" ? body.message : "";
@@ -385,7 +412,8 @@ export async function POST(req: Request) {
     const history = normalizeHistory(body.history);
     const egoId = typeof body.egoId === "string" ? body.egoId : null;
     if (!message.trim()) {
-      return NextResponse.json({
+      debug.ollamaError = "skipped: empty message";
+      return respond({
         reply: "Tell me a family fact to get started — for example, “My dad is Minh, born 1960 in Hanoi.”",
         proposals: [],
         modelUsed: "fallback",
@@ -399,30 +427,33 @@ export async function POST(req: Request) {
       `request (roster ${roster.length}, relationships ${relationships.length}, history ${history.length}, ego ${egoId ?? "none"})` +
         (LOG_CONTENT ? `:\n${indent(message)}` : "")
     );
-    const ollama = await tryOllama(message, roster, relationships, egoId, history);
+    const ollama = await tryOllama(message, roster, relationships, egoId, history, debug);
     if (ollama) {
+      debug.source = "ollama";
       logProposals(ollama.modelUsed, ollama.proposals);
-      return NextResponse.json(ollama);
+      return respond(ollama);
     }
 
     const started = Date.now();
     const fallback = extractFallback(message, roster, egoId, relationships, history);
-    log(`fallback parser ran in ${Date.now() - started}ms`);
+    debug.fallbackMs = Date.now() - started;
+    log(`fallback parser ran in ${debug.fallbackMs}ms`);
     logProposals(fallback.modelUsed, fallback.proposals);
-    return NextResponse.json(fallback);
+    return respond(fallback);
   } catch (err) {
     log("request failed, returning safe reply:", err);
+    debug.ollamaError ??= `request failed: ${(err as Error)?.message ?? err}`;
     // Last-resort guard: the chat UI must never get a 500 for a
     // normal message, even if the request body was malformed.
     try {
       const fallback = extractFallback("", [], null);
-      return NextResponse.json({
+      return respond({
         reply: "Something went wrong reading that message — could you try again with one fact, like “My dad is Minh, born 1960 in Hanoi”?",
         proposals: fallback.proposals,
         modelUsed: "fallback" as const,
       });
     } catch {
-      return NextResponse.json({
+      return respond({
         reply: "Something went wrong — please try again.",
         proposals: [],
         modelUsed: "fallback",

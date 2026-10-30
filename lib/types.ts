@@ -94,3 +94,24 @@ export type RosterPerson = Pick<
 export type RosterRelationship = Pick<Relationship, "fromPersonId" | "toPersonId" | "type">;
 
 export type ChatHistoryItem = Pick<ChatMessage, "role" | "text">;
+
+// How /api/chat produced its proposals. Only sent outside production
+// (or with CHAT_DEBUG=1) so end users never see connection errors.
+export type ExtractionDebug = {
+  source: "ollama" | "fallback";
+  model: string;
+  host: string;
+  // Why Ollama's answer was not used, when source is "fallback".
+  ollamaError?: string;
+  ollamaMs?: number;
+  fallbackMs?: number;
+  totalMs: number;
+  promptTokens?: number;
+  outputTokens?: number;
+  doneReason?: string;
+  // Proposals in the model's JSON vs. kept after validation.
+  returned?: number;
+  kept: number;
+  // The model's raw JSON, development only (it contains family names).
+  rawOutput?: string;
+};

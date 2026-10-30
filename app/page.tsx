@@ -32,12 +32,15 @@ const SNAP = 8;
 const EXAMPLE = "I'm Lan. My dad is Minh, born 1960 in Hanoi. He married my mom, Hoa.";
 const SIZE: LayoutSize = { nodeW: 184, nodeH: 64, hGap: 24, vGap: 64 };
 const PAD = 32;
+const MIN_ZOOM = 0.4;
+const MAX_ZOOM = 1.6;
 
 type Message = ChatMessage & { batchId?: string; tone?: "error" | "muted" };
 type RelativeKind = "parent" | "partner" | "child" | "sibling";
 type Toast = { label: string; onUndo?: () => void };
 type Point = { x: number; y: number };
 type DragState = { id: string; startX: number; startY: number; origin: Point; at: Point; moved: boolean };
+type PanState = { pointerId: number; startX: number; startY: number; origin: Point; moved: boolean; onBackground: boolean };
 type QuickAdd = { kind: RelativeKind; name: string; withPartner: boolean };
 
 const KIND_LABEL: Record<RelativeKind, string> = {
@@ -134,7 +137,12 @@ export default function Home() {
   const [showAdd, setShowAdd] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const [recentIds, setRecentIds] = useState<Set<string>>(new Set());
-  const [zoom, setZoom] = useState(1);
+  // Screen offset (x, y) and scale of the tree stage inside the canvas.
+  // Kept in one state so zooming around a point updates both atomically.
+  const [view, setView] = useState({ x: 0, y: 0, zoom: 1 });
+  const zoom = view.zoom;
+  const panRef = useRef<PanState | null>(null);
+  const [panning, setPanning] = useState(false);
   // Positions the user dragged to, in layout coordinates. People
   // without an entry keep their auto-layout spot.
   const [manualPos, setManualPos] = useState<Record<string, Point>>({});
@@ -378,6 +386,9 @@ export default function Home() {
     const after = { ...next, proposals: rejectProposalBatch(next, dropped) };
     const added = after.people.filter((p) => !before.people.some((x) => x.id === p.id));
     const links = after.relationships.length - before.relationships.length;
+    // #region agent log
+    fetch('http://127.0.0.1:7308/ingest/3cf7ad3c-7927-4fa0-9b56-93e383e41bc7',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'896027'},body:JSON.stringify({sessionId:'896027',runId:'run1',hypothesisId:'B',location:'page.tsx:acceptBatch',message:'accept batch result',data:{items:items.length,chosen:chosen.length,chosenKinds:chosen.map((p)=>p.kind),chosenHaveName:chosen.map((p)=>!!p.displayName),dropped:dropped.length,added:added.length,links,skipped:skipped.length,peopleBefore:before.people.length,peopleAfter:after.people.length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     commit(
       after,
       [
@@ -449,6 +460,9 @@ export default function Home() {
       const batch = Array.isArray(data.proposals)
         ? scopeBatch(data.proposals as Proposal[], people, prefix)
         : [];
+      // #region agent log
+      fetch('http://127.0.0.1:7308/ingest/3cf7ad3c-7927-4fa0-9b56-93e383e41bc7',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'896027'},body:JSON.stringify({sessionId:'896027',runId:'run1',hypothesisId:'A,B',location:'page.tsx:sendChat',message:'chat response',data:{status:res.status,rawProposals:Array.isArray(data.proposals)?data.proposals.length:typeof data.proposals,batch:batch.length,kinds:batch.map((p)=>p.kind),haveName:batch.map((p)=>!!p.displayName),confidences:batch.map((p)=>p.confidence),modelUsed:data.modelUsed},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       setMessages((m) => [
         ...m,
         {
@@ -573,11 +587,27 @@ export default function Home() {
   function selectAndReveal(id: string) {
     setSelectedId(id);
     setMobileTab("tree");
-    requestAnimationFrame(() =>
-      canvasRef.current
-        ?.querySelector(`[data-id="${CSS.escape(id)}"]`)
-        ?.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" })
-    );
+    reveal(id);
+  }
+
+  // Pans so the card is centred. Runs a frame later because the card
+  // may have been added (or the tree tab shown) in this same update.
+  function reveal(id: string, onlyIfHidden = false) {
+    requestAnimationFrame(() => {
+      const el = canvasRef.current;
+      const node = el?.querySelector<HTMLElement>(`[data-id="${CSS.escape(id)}"]`);
+      if (!el || !node) return;
+      const c = el.getBoundingClientRect();
+      if (c.width === 0) return;
+      const n = node.getBoundingClientRect();
+      const m = 24;
+      const visible =
+        n.left >= c.left + m && n.right <= c.right - m && n.top >= c.top + m && n.bottom <= c.bottom - m;
+      if (onlyIfHidden && visible) return;
+      const dx = c.left + c.width / 2 - (n.left + n.width / 2);
+      const dy = c.top + c.height / 2 - (n.top + n.height / 2);
+      setView((v) => ({ ...v, x: v.x + dx, y: v.y + dy }));
+    });
   }
 
   // --- Layout ------------------------------------------------------------
@@ -653,6 +683,65 @@ export default function Home() {
     setDrag(null);
   }
 
+  // Dragging empty space (or a review-pending card, which can't be
+  // moved) pans the whole tree. Real cards keep their own drag.
+  function onCanvasPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0 || panRef.current) return;
+    const target = e.target as Element;
+    if (target.closest(".pt-node:not(.pending)")) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    panRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origin: { x: view.x, y: view.y },
+      moved: false,
+      onBackground: !target.closest(".pt-node"),
+    };
+  }
+
+  function onCanvasPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    const p = panRef.current;
+    if (!p || p.pointerId !== e.pointerId) return;
+    const dx = e.clientX - p.startX;
+    const dy = e.clientY - p.startY;
+    if (!p.moved && Math.hypot(dx, dy) < 4) return;
+    if (!p.moved) setPanning(true);
+    p.moved = true;
+    setView((v) => ({ ...v, x: p.origin.x + dx, y: p.origin.y + dy }));
+  }
+
+  function onCanvasPointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    const p = panRef.current;
+    if (!p || p.pointerId !== e.pointerId) return;
+    // Pointer capture retargets the click to the canvas, so a plain
+    // click on empty space clears the selection here instead.
+    if (!p.moved && p.onBackground && e.type === "pointerup") setSelectedId(null);
+    panRef.current = null;
+    setPanning(false);
+  }
+
+  // Focusing a card (e.g. with Tab) makes the browser scroll the
+  // clipped canvas; fold that scroll into the pan instead.
+  function onCanvasScroll(e: React.UIEvent<HTMLDivElement>) {
+    const el = e.currentTarget;
+    const { scrollLeft: sx, scrollTop: sy } = el;
+    if (!sx && !sy) return;
+    el.scrollLeft = 0;
+    el.scrollTop = 0;
+    setView((v) => ({ ...v, x: v.x - sx, y: v.y - sy }));
+  }
+
+  function zoomAt(next: (z: number) => number, anchor?: Point) {
+    const el = canvasRef.current;
+    const a = anchor ?? { x: (el?.clientWidth ?? 0) / 2, y: (el?.clientHeight ?? 0) / 2 };
+    setView((v) => {
+      const z = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, next(v.zoom)));
+      const k = z / v.zoom;
+      return { zoom: z, x: a.x - (a.x - v.x) * k, y: a.y - (a.y - v.y) * k };
+    });
+  }
+
   // Arrows move focus between people: up to a parent, down to a child,
   // left/right along the same row. Alt+arrows nudge the card instead.
   function onNodeKeyDown(e: React.KeyboardEvent, p: (typeof positioned)[number]) {
@@ -665,7 +754,10 @@ export default function Home() {
     }
     const target = neighbourOf(p, e.key);
     if (target) {
-      canvasRef.current?.querySelector<HTMLElement>(`[data-id="${CSS.escape(target)}"]`)?.focus();
+      canvasRef.current
+        ?.querySelector<HTMLElement>(`[data-id="${CSS.escape(target)}"]`)
+        ?.focus({ preventScroll: true });
+      reveal(target, true);
     }
   }
 
@@ -714,33 +806,82 @@ export default function Home() {
   const height = (positioned.length ? Math.max(...positioned.map((p) => p.y)) + SIZE.nodeH : 0) + PAD * 2;
   const hoverNode = hoverId ? preview.proposalByNode.get(hoverId) ?? null : null;
 
+  // #region agent log
+  useEffect(() => {
+    const tree = document.querySelector(".pt-tree") as HTMLElement | null;
+    const main = document.querySelector(".pt-main") as HTMLElement | null;
+    const r = tree?.getBoundingClientRect();
+    const c = canvasRef.current?.getBoundingClientRect();
+    fetch('http://127.0.0.1:7308/ingest/3cf7ad3c-7927-4fa0-9b56-93e383e41bc7',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'896027'},body:JSON.stringify({sessionId:'896027',runId:'run1',hypothesisId:'A,B,C,E',location:'page.tsx:treeState',message:'tree render state',data:{loaded,viewportW:window.innerWidth,viewportH:window.innerHeight,mobileTab,mainClass:main?.className,treeDisplay:tree?getComputedStyle(tree).display:'NO_TREE_EL',treeRect:r?{w:r.width,h:r.height,x:r.x,y:r.y}:null,canvasRect:c?{w:c.width,h:c.height}:null,people:people.length,rels:relationships.length,pendingPeople:preview.pendingPeople.length,proposals:proposals.length,positioned:positioned.length,width,height,zoom,manualPosCount:Object.keys(manualPos).length,badPos:positioned.filter((p)=>!Number.isFinite(p.x)||!Number.isFinite(p.y)).length,nodesInDom:document.querySelectorAll('.pt-node').length,emptyShown:!!document.querySelector('.pt-empty')},timestamp:Date.now()})}).catch(()=>{});
+  }, [loaded, mobileTab, people.length, relationships.length, preview.pendingPeople.length, positioned.length, width, height, zoom, manualPos]);
+  useEffect(() => {
+    const onErr = (ev: ErrorEvent | PromiseRejectionEvent) => {
+      const msg = "message" in ev ? ev.message : String((ev as PromiseRejectionEvent).reason);
+      const stack = "error" in ev ? (ev.error as Error | undefined)?.stack?.slice(0, 800) : undefined;
+      fetch('http://127.0.0.1:7308/ingest/3cf7ad3c-7927-4fa0-9b56-93e383e41bc7',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'896027'},body:JSON.stringify({sessionId:'896027',runId:'run1',hypothesisId:'D',location:'page.tsx:windowError',message:'runtime error',data:{msg,stack},timestamp:Date.now()})}).catch(()=>{});
+    };
+    window.addEventListener("error", onErr);
+    window.addEventListener("unhandledrejection", onErr);
+    return () => {
+      window.removeEventListener("error", onErr);
+      window.removeEventListener("unhandledrejection", onErr);
+    };
+  }, []);
+  // #endregion
+
+  function centerAt(z: number) {
+    const el = canvasRef.current;
+    if (!el) return;
+    setView({ zoom: z, x: (el.clientWidth - width * z) / 2, y: (el.clientHeight - height * z) / 2 });
+  }
+
   function fit() {
     const el = canvasRef.current;
     if (!el || !positioned.length) return;
     const scale = Math.min((el.clientWidth - 16) / width, (el.clientHeight - 16) / height);
-    setZoom(Math.max(0.4, Math.min(1.25, Math.round(scale * 20) / 20)));
+    centerAt(Math.max(MIN_ZOOM, Math.min(1.25, Math.round(scale * 20) / 20)));
   }
 
+  const hasTree = positioned.length > 0;
   const fittedOnce = useRef(false);
   useEffect(() => {
-    if (!loaded || fittedOnce.current || people.length === 0) return;
-    fittedOnce.current = true;
+    if (!loaded || fittedOnce.current || !hasTree) return;
     const el = canvasRef.current;
-    if (el && (width > el.clientWidth || height > el.clientHeight)) fit();
+    // On mobile the tree tab may be hidden; wait until it has a size.
+    if (!el || el.clientWidth === 0) return;
+    fittedOnce.current = true;
+    if (width > el.clientWidth || height > el.clientHeight) fit();
+    else centerAt(1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, people.length]);
+  }, [loaded, hasTree, mobileTab]);
+
+  // Wheel pans; Ctrl/Cmd+wheel (and trackpad pinch) zooms around the
+  // cursor. React's onWheel is passive, so preventDefault needs this.
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const unit = e.deltaMode === 1 ? 16 : 1;
+      if (e.ctrlKey || e.metaKey) {
+        const r = el.getBoundingClientRect();
+        zoomAt((z) => z * Math.exp(-e.deltaY * unit * 0.002), { x: e.clientX - r.left, y: e.clientY - r.top });
+      } else {
+        setView((v) => ({ ...v, x: v.x - e.deltaX * unit, y: v.y - e.deltaY * unit }));
+      }
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+    // zoomAt only touches refs and state setters, so the first one is fine.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasTree]);
 
   // Ghost nodes often land outside the visible area; bring the first
   // one into view when a new batch arrives.
   const pendingKey = [...preview.pendingIds].join("|");
   useEffect(() => {
     const first = [...preview.pendingIds][0];
-    if (!first) return;
-    requestAnimationFrame(() =>
-      canvasRef.current
-        ?.querySelector(`[data-id="${CSS.escape(first)}"]`)
-        ?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" })
-    );
+    if (first) reveal(first, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingKey]);
 
@@ -1020,22 +1161,27 @@ export default function Home() {
               </div>
             </div>
           ) : (
-            <div className="pt-canvas" ref={canvasRef}>
-              <div className="pt-sizer" style={{ width: width * zoom, height: height * zoom }}>
-                <div
-                  className="pt-stage"
-                  style={{ width, height, transform: `scale(${zoom})` }}
-                  onClick={(e) => e.target === e.currentTarget && setSelectedId(null)}
-                >
-                  <svg width={width} height={height} className="pt-lines">
-                    <g transform={`translate(${PAD},${PAD})`}>
-                      {connectors.map((c) => (
-                        <path key={c.key} d={c.d} className={`pt-line ${c.kind} ${c.pending ? "pending" : ""}`} />
-                      ))}
-                    </g>
-                  </svg>
-                  {positioned.map(renderNode)}
-                </div>
+            <div
+              className={`pt-canvas ${panning ? "panning" : ""}`}
+              ref={canvasRef}
+              onPointerDown={onCanvasPointerDown}
+              onPointerMove={onCanvasPointerMove}
+              onPointerUp={onCanvasPointerUp}
+              onPointerCancel={onCanvasPointerUp}
+              onScroll={onCanvasScroll}
+            >
+              <div
+                className="pt-stage"
+                style={{ width, height, transform: `translate(${view.x}px, ${view.y}px) scale(${zoom})` }}
+              >
+                <svg width={width} height={height} className="pt-lines">
+                  <g transform={`translate(${PAD},${PAD})`}>
+                    {connectors.map((c) => (
+                      <path key={c.key} d={c.d} className={`pt-line ${c.kind} ${c.pending ? "pending" : ""}`} />
+                    ))}
+                  </g>
+                </svg>
+                {positioned.map(renderNode)}
               </div>
             </div>
           )}
@@ -1043,13 +1189,13 @@ export default function Home() {
           {positioned.length > 0 && (
             <>
               <div className="pt-zoom" role="group" aria-label="Zoom">
-                <button onClick={() => setZoom((z) => Math.max(0.4, +(z - 0.1).toFixed(2)))} aria-label="Zoom out">
+                <button onClick={() => zoomAt((z) => +(z - 0.1).toFixed(2))} aria-label="Zoom out">
                   −
                 </button>
-                <button onClick={() => setZoom(1)} title="Reset to 100%">
+                <button onClick={() => zoomAt(() => 1)} title="Reset to 100%">
                   {Math.round(zoom * 100)}%
                 </button>
-                <button onClick={() => setZoom((z) => Math.min(1.6, +(z + 0.1).toFixed(2)))} aria-label="Zoom in">
+                <button onClick={() => zoomAt((z) => +(z + 0.1).toFixed(2))} aria-label="Zoom in">
                   +
                 </button>
                 <button onClick={fit}>Fit</button>
@@ -1065,7 +1211,7 @@ export default function Home() {
                 {preview.pendingIds.size > 0 && (
                   <span><i className="lg pending" /> Waiting for review</span>
                 )}
-                <span>Drag or Alt+arrows to rearrange</span>
+                <span>Drag cards to rearrange · drag empty space to pan</span>
               </div>
             </>
           )}

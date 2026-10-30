@@ -147,9 +147,9 @@ button { cursor: pointer; }
 
 /* Tree */
 .pt-tree { position: relative; min-height: 0; overflow: hidden; background-color: #fff; background-image: radial-gradient(#efe6d8 1px, transparent 1px); background-size: 20px 20px; }
-.pt-canvas { position: absolute; inset: 0; overflow: auto; display: flex; }
-.pt-sizer { margin: auto; flex-shrink: 0; }
-.pt-stage { position: relative; transform-origin: 0 0; }
+.pt-canvas { position: absolute; inset: 0; overflow: hidden; cursor: grab; touch-action: none; }
+.pt-canvas.panning { cursor: grabbing; }
+.pt-stage { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
 .pt-lines { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
 .pt-line { fill: none; stroke-width: 2; stroke-linejoin: round; }
 .pt-line.parent { stroke: #c4b096; }

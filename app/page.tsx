@@ -24,6 +24,7 @@ import {
   type TreeState,
 } from "@/lib/proposals";
 import { birthLabel, yearOf } from "@/lib/dates";
+import { MAX_FILE_BYTES, exportFileName, parseTreeFile, serializeTree, type TreeFile } from "@/lib/tree-file";
 
 const STORAGE_KEY = "family-tree-mvp-v1";
 const CHAT_KEY = "family-tree-mvp-v1-chat";
@@ -42,6 +43,7 @@ type Point = { x: number; y: number };
 type DragState = { id: string; startX: number; startY: number; origin: Point; at: Point; moved: boolean };
 type PanState = { pointerId: number; startX: number; startY: number; origin: Point; moved: boolean; onBackground: boolean };
 type QuickAdd = { kind: RelativeKind; name: string; withPartner: boolean };
+type PendingImport = { file: TreeFile; name: string };
 
 const KIND_LABEL: Record<RelativeKind, string> = {
   parent: "Parent",
@@ -135,6 +137,8 @@ export default function Home() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [quickAdd, setQuickAdd] = useState<QuickAdd | null>(null);
   const [showAdd, setShowAdd] = useState(false);
+  const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [recentIds, setRecentIds] = useState<Set<string>>(new Set());
   // Screen offset (x, y) and scale of the tree stage inside the canvas.
@@ -143,6 +147,7 @@ export default function Home() {
   const zoom = view.zoom;
   const panRef = useRef<PanState | null>(null);
   const [panning, setPanning] = useState(false);
+  const [refit, setRefit] = useState(0);
   // Positions the user dragged to, in layout coordinates. People
   // without an entry keep their auto-layout spot.
   const [manualPos, setManualPos] = useState<Record<string, Point>>({});
@@ -261,13 +266,14 @@ export default function Home() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      if (showAdd) setShowAdd(false);
+      if (pendingImport) setPendingImport(null);
+      else if (showAdd) setShowAdd(false);
       else if (quickAdd) setQuickAdd(null);
       else setSelectedId(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [showAdd, quickAdd]);
+  }, [pendingImport, showAdd, quickAdd]);
 
   useEffect(() => {
     setQuickAdd(null);
@@ -610,6 +616,66 @@ export default function Home() {
     });
   }
 
+  // --- Export / import ---------------------------------------------------
+
+  function exportTree() {
+    const json = serializeTree({ people, relationships, egoId, layout: manualPos });
+    const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = exportFileName();
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function pickImport(input: HTMLInputElement) {
+    const file = input.files?.[0];
+    // Reset so picking the same file again still fires onChange.
+    input.value = "";
+    if (!file) return;
+    if (file.size > MAX_FILE_BYTES) {
+      showToast({ label: "That file is too large to be a tree export." });
+      return;
+    }
+    let text: string;
+    try {
+      text = await file.text();
+    } catch {
+      showToast({ label: "That file couldn't be read." });
+      return;
+    }
+    const result = parseTreeFile(text);
+    if (!result.ok) {
+      showToast({ label: result.error });
+      return;
+    }
+    if (people.length === 0) applyImport(result.data, file.name);
+    else setPendingImport({ file: result.data, name: file.name });
+  }
+
+  function applyImport(file: TreeFile, name: string) {
+    const before = snapshot();
+    const beforeLayout = manualPos;
+    // Pending suggestions point at ids from the old tree, so they go too.
+    commit({ people: file.people, relationships: file.relationships, egoId: file.egoId, proposals: [], resolvedRefs: {} }, null);
+    setManualPos(file.layout);
+    setSelectedId(null);
+    setQuickAdd(null);
+    setSameAs({});
+    setUnchecked(new Set());
+    setPendingImport(null);
+    setRefit((n) => n + 1);
+    const count = `${file.people.length} ${file.people.length === 1 ? "person" : "people"}`;
+    setMessages((m) => [...m, { id: uid(), role: "assistant", tone: "muted", text: `Loaded ${count} from ${name}.` }]);
+    showToast({
+      label: `Imported ${count}`,
+      onUndo: () => {
+        commit(before, null);
+        setManualPos(beforeLayout);
+      },
+    });
+  }
+
   // --- Layout ------------------------------------------------------------
 
   const autoPositioned = useMemo(() => layoutTree(allPeople, allRels, SIZE), [allPeople, allRels]);
@@ -876,6 +942,12 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasTree]);
 
+  // Runs after the imported tree has rendered, so fit() sees its size.
+  useEffect(() => {
+    if (refit) fit();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refit]);
+
   // Ghost nodes often land outside the visible area; bring the first
   // one into view when a new batch arrives.
   const pendingKey = [...preview.pendingIds].join("|");
@@ -1066,6 +1138,28 @@ export default function Home() {
         </span>
         <span className="pt-saved">Saved in this browser</span>
         <div className="pt-header-actions">
+          <button
+            className="pt-btn pt-btn-ghost"
+            onClick={exportTree}
+            disabled={people.length === 0}
+            title="Download your tree as a file you can import later"
+          >
+            Export
+          </button>
+          <button
+            className="pt-btn pt-btn-ghost"
+            onClick={() => importInputRef.current?.click()}
+            title="Load a tree from an exported file"
+          >
+            Import
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".json,application/json"
+            hidden
+            onChange={(e) => void pickImport(e.currentTarget)}
+          />
           <button className="pt-btn pt-btn-secondary" onClick={() => setShowAdd(true)}>
             + Person
           </button>
@@ -1250,6 +1344,16 @@ export default function Home() {
             setShowAdd(false);
             selectAndReveal(id);
           }}
+        />
+      )}
+
+      {pendingImport && (
+        <ImportConfirmDialog
+          current={people.length}
+          incoming={pendingImport.file.people.length}
+          fileName={pendingImport.name}
+          onCancel={() => setPendingImport(null)}
+          onConfirm={() => applyImport(pendingImport.file, pendingImport.name)}
         />
       )}
 
@@ -1466,6 +1570,35 @@ function PersonDrawer(props: {
         )}
       </div>
     </aside>
+  );
+}
+
+function ImportConfirmDialog(props: {
+  current: number;
+  incoming: number;
+  fileName: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const plural = (n: number) => `${n} ${n === 1 ? "person" : "people"}`;
+  return (
+    <div className="pt-overlay" onMouseDown={(e) => e.target === e.currentTarget && props.onCancel()}>
+      <div className="pt-dialog" role="dialog" aria-label="Replace your tree">
+        <h2>Replace your tree?</h2>
+        <p>
+          Your tree of {plural(props.current)} will be replaced by {plural(props.incoming)} from{" "}
+          <strong>{props.fileName}</strong>. Pending suggestions in the chat will be cleared. You can undo right after.
+        </p>
+        <div className="pt-row end">
+          <button type="button" className="pt-btn pt-btn-ghost" autoFocus onClick={props.onCancel}>
+            Cancel
+          </button>
+          <button type="button" className="pt-btn pt-btn-danger" onClick={props.onConfirm}>
+            Replace
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

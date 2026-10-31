@@ -51,6 +51,7 @@ button { cursor: pointer; }
 }
 .pt-dot { width: 7px; height: 7px; border-radius: 50%; background: #c9b9a6; }
 .pt-dot.on { background: var(--green); }
+.pt-dot.cloud { background: #2563eb; }
 .pt-saved { font-size: 12px; color: var(--muted); }
 .pt-header-actions { margin-left: auto; display: flex; align-items: center; gap: 12px; }
 .pt-tabs { display: none; }

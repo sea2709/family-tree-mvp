@@ -25,9 +25,23 @@ import {
   type TreeState,
 } from "@/lib/proposals";
 import { birthLabel, yearOf } from "@/lib/dates";
+import {
+  LOCATION_NAME,
+  isModelLocation,
+  modelLocation,
+  modelStatus,
+  type ModelConfig,
+} from "@/lib/model-location";
 import { matchPeople, relativeCandidates, type RelativeKind } from "@/lib/people-search";
 import { resizeImage, shrinkImage } from "@/lib/images";
-import { deletePhotoBlobs, getPhotoBlob, isQuotaError, putPhotoBlobs, requestPersistence } from "@/lib/photo-store";
+import {
+  deletePhotoBlobs,
+  getPhotoBlob,
+  isQuotaError,
+  pruneOrphanPhotoBlobs,
+  putPhotoBlobs,
+  requestPersistence,
+} from "@/lib/photo-store";
 import { PhotoGrid, PhotoViewer, Slideshow, TreeGalleryDialog } from "./photos";
 import { MAX_FILE_BYTES, exportFileName, parseTreeFile, serializeTree, type TreeFile } from "@/lib/tree-file";
 
@@ -57,10 +71,10 @@ const KIND_LABEL: Record<RelativeKind, string> = {
   sibling: "Sibling",
 };
 
-function modelLabel(note: string | null): string {
-  if (!note) return "Local AI or offline parser";
-  if (note.startsWith("ollama:")) return `Local AI · ${note.slice("ollama:".length)}`;
-  return "Offline parser";
+function readModelConfig(data: unknown): ModelConfig | null {
+  if (!data || typeof data !== "object") return null;
+  const { where, model } = data as Record<string, unknown>;
+  return isModelLocation(where) && typeof model === "string" ? { where, model } : null;
 }
 
 function formatMs(ms?: number): string {
@@ -73,8 +87,8 @@ function DebugInfo({ debug }: { debug: ExtractionDebug }) {
   const counts =
     debug.returned !== undefined ? `${debug.kept} of ${debug.returned} kept` : `${debug.kept} proposal(s)`;
   const summary = viaOllama
-    ? `Local AI · ${debug.model} · ${formatMs(debug.ollamaMs)} · ${counts}`
-    : `Fallback parser · ${counts} · Ollama: ${debug.ollamaError ?? "not used"}`;
+    ? `${LOCATION_NAME[modelLocation(debug.host)]} · ${debug.model} · ${formatMs(debug.ollamaMs)} · ${counts}`
+    : `Built-in parser · ${counts} · Ollama: ${debug.ollamaError ?? "not used"}`;
   const rows: [string, string | number | undefined][] = [
     ["Source", viaOllama ? `ollama:${debug.model}` : "fallback (rule-based)"],
     ["Ollama host", debug.host],
@@ -153,6 +167,7 @@ export default function Home() {
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [resolvedRefs, setResolvedRefs] = useState<Record<string, string>>({});
   const [modelNote, setModelNote] = useState<string | null>(null);
+  const [modelConfig, setModelConfig] = useState<ModelConfig | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   const [unchecked, setUnchecked] = useState<Set<string>>(new Set());
@@ -203,6 +218,8 @@ export default function Home() {
         if (Array.isArray(parsed.people)) savedPeople = parsed.people;
         if (Array.isArray(parsed.relationships)) setRelationships(parsed.relationships);
         if (typeof parsed.egoId === "string") setEgoId(parsed.egoId);
+        const savedPhotos: Photo[] = Array.isArray(parsed.photos) ? parsed.photos : [];
+        pruneOrphanPhotoBlobs(new Set(savedPhotos.map((ph) => ph.id))).catch(() => {});
         if (Array.isArray(parsed.photos)) {
           // Undo can't outlive a reload, so tags of deleted people can go.
           const live = new Set(savedPeople.map((p) => p.id));
@@ -246,6 +263,20 @@ export default function Home() {
           ]
     );
     setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch("/api/chat", { signal: controller.signal })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        const config = readModelConfig(data);
+        if (config) setModelConfig(config);
+      })
+      .catch(() => {
+        // The pill keeps its generic label; the next chat reply fills it in.
+      });
+    return () => controller.abort();
   }, []);
 
   useEffect(() => {
@@ -533,6 +564,8 @@ export default function Home() {
         setMobileTab("chat");
       }
       if (typeof data.modelUsed === "string") setModelNote(data.modelUsed);
+      const config = readModelConfig(data);
+      if (config) setModelConfig(config);
     } catch (err) {
       const aborted = err instanceof DOMException && err.name === "AbortError";
       setMessages((m) => [
@@ -575,7 +608,6 @@ export default function Home() {
       return ["My parents are ", "My dad is ", "My mom is "];
     }
     return ["My grandparents are ", "My brother is ", "My sister is "];
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [people, relationships, selected, ego]);
 
   function applySuggestion(s: string) {
@@ -803,7 +835,12 @@ export default function Home() {
     const beforeLayout = manualPos;
     const beforeMessages = messages;
     const beforeModelNote = modelNote;
+    const beforePhotos = photos;
     commit({ people: [], relationships: [], egoId: null, proposals: [], resolvedRefs: {} }, null);
+    setPhotos([]);
+    setShowPhotos(false);
+    setViewPhotoId(null);
+    setSlideshowIds(null);
     setManualPos({});
     setMessages([{ id: uid(), role: "assistant", text: FRESH_WELCOME }]);
     setModelNote(null);
@@ -819,6 +856,7 @@ export default function Home() {
       label: "Tree reset",
       onUndo: () => {
         commit(before, null);
+        setPhotos(beforePhotos);
         setManualPos(beforeLayout);
         setMessages(beforeMessages);
         setModelNote(beforeModelNote);
@@ -1066,8 +1104,6 @@ export default function Home() {
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-    // zoomAt only touches refs and state setters, so the first one is fine.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasTree]);
 
   // Runs after the imported tree has rendered, so fit() sees its size.
@@ -1084,6 +1120,8 @@ export default function Home() {
     if (first) reveal(first, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingKey]);
+
+  const status = modelStatus(modelNote, modelConfig);
 
   const batches = useMemo(() => {
     const ids: string[] = [];
@@ -1267,9 +1305,9 @@ export default function Home() {
           <span aria-hidden>🌱</span>
           <h1>Family Tree</h1>
         </div>
-        <span className="pt-pill" title="Extraction runs on your machine when Ollama is running; otherwise a rule-based parser.">
-          <span className={`pt-dot ${modelNote?.startsWith("ollama:") ? "on" : ""}`} />
-          {modelLabel(modelNote)}
+        <span className="pt-pill" title={status.title}>
+          <span className={`pt-dot ${status.tone}`} />
+          {status.label}
         </span>
         <span className="pt-saved">Saved in this browser</span>
         <div className="pt-header-actions">
@@ -1300,7 +1338,7 @@ export default function Home() {
           <button
             className="pt-btn pt-btn-ghost pt-btn-icon"
             onClick={() => setConfirmReset(true)}
-            disabled={loading || (people.length === 0 && proposals.length === 0)}
+            disabled={loading || (people.length === 0 && proposals.length === 0 && photos.length === 0)}
             title="Clear everyone and start a new tree"
           >
             <ResetIcon />
@@ -1549,6 +1587,7 @@ export default function Home() {
       {confirmReset && (
         <ResetConfirmDialog
           current={people.length}
+          photos={photos.length}
           onCancel={() => setConfirmReset(false)}
           onConfirm={resetTree}
         />
@@ -1604,13 +1643,15 @@ function PersonDrawer(props: {
   const [listOpen, setListOpen] = useState(true);
 
   const coParentId = quickAdd?.kind === "child" && quickAdd.withPartner && soloPartner ? soloPartner.id : null;
+  const quickKind = quickAdd?.kind;
+  const quickName = quickAdd?.name;
   const candidates = useMemo(
-    () => (quickAdd ? relativeCandidates(quickAdd.kind, person.id, people, relationships, coParentId) : []),
-    [quickAdd?.kind, coParentId, person.id, people, relationships]
+    () => (quickKind ? relativeCandidates(quickKind, person.id, people, relationships, coParentId) : []),
+    [quickKind, coParentId, person.id, people, relationships]
   );
   const matches = useMemo(
-    () => (quickAdd ? matchPeople(quickAdd.name, candidates, relationships) : []),
-    [quickAdd?.name, candidates, relationships]
+    () => (quickName !== undefined ? matchPeople(quickName, candidates, relationships) : []),
+    [quickName, candidates, relationships]
   );
   const showList = listOpen && !!quickAdd?.name.trim();
   // Rows are the matches followed by the "Add new" row.
@@ -1898,14 +1939,15 @@ function ImportConfirmDialog(props: {
   );
 }
 
-function ResetConfirmDialog(props: { current: number; onCancel: () => void; onConfirm: () => void }) {
+function ResetConfirmDialog(props: { current: number; photos: number; onCancel: () => void; onConfirm: () => void }) {
   const plural = (n: number) => `${n} ${n === 1 ? "person" : "people"}`;
+  const photoNote = props.photos ? `, ${props.photos === 1 ? "1 photo" : `${props.photos} photos`}` : "";
   return (
     <div className="pt-overlay" onMouseDown={(e) => e.target === e.currentTarget && props.onCancel()}>
       <div className="pt-dialog" role="dialog" aria-label="Reset your tree">
         <h2>Reset your tree?</h2>
         <p>
-          All {plural(props.current)}, their links, your layout, pending suggestions and the chat history will be
+          All {plural(props.current)}, their links{photoNote}, your layout, pending suggestions and the chat history will be
           cleared. You can undo right after — or Export first to keep a copy.
         </p>
         <div className="pt-row end">

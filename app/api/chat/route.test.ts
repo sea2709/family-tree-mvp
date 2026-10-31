@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtractionDebug, Proposal } from "@/lib/types";
-import { POST } from "./route";
+import { GET, POST } from "./route";
 
-type ChatResponse = { reply: string; proposals: Proposal[]; modelUsed: string; debug?: ExtractionDebug };
+type ChatResponse = {
+  reply: string;
+  proposals: Proposal[];
+  modelUsed: string;
+  where: string;
+  model: string;
+  debug?: ExtractionDebug;
+};
 
 async function chat(body: unknown): Promise<ChatResponse> {
   const req = new Request("http://localhost/api/chat", {
@@ -34,7 +41,22 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
 });
 
+describe("GET /api/chat", () => {
+  it("returns only where the model runs and its name, not the host", async () => {
+    const res = GET();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ where: "local", model: "gemma4:12b" });
+  });
+});
+
 describe("POST /api/chat", () => {
+  it("says where the model runs on every reply", async () => {
+    fetchMock.mockResolvedValue(new Response("", { status: 500 }));
+    const res = await chat({ message: "I'm Lan" });
+    expect(res.modelUsed).toBe("fallback");
+    expect(res).toMatchObject({ where: "local", model: "gemma4:12b" });
+  });
+
   it("asks for a fact when the message is empty, without calling Ollama", async () => {
     const res = await chat({ message: "   " });
     expect(res.proposals).toEqual([]);

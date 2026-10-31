@@ -1,6 +1,13 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
-import { deletePhotoBlobs, getPhotoBlob, isQuotaError, putPhotoBlobs, requestPersistence } from "./photo-store";
+import {
+  deletePhotoBlobs,
+  getPhotoBlob,
+  isQuotaError,
+  pruneOrphanPhotoBlobs,
+  putPhotoBlobs,
+  requestPersistence,
+} from "./photo-store";
 
 describe("photo blobs in IndexedDB", () => {
   it("stores, reads and deletes both variants of a photo", async () => {
@@ -15,6 +22,18 @@ describe("photo blobs in IndexedDB", () => {
 
   it("returns null for a photo that was never stored", async () => {
     expect(await getPhotoBlob("missing", "full")).toBeNull();
+  });
+
+  it("prunes blobs of photos that are no longer listed", async () => {
+    await putPhotoBlobs("keep", { full: new Blob(["k"]), thumb: new Blob(["kt"]) });
+    await putPhotoBlobs("gone", { full: new Blob(["g"]), thumb: new Blob(["gt"]) });
+
+    await pruneOrphanPhotoBlobs(new Set(["keep"]));
+
+    expect(await (await getPhotoBlob("keep", "full"))?.text()).toBe("k");
+    expect(await (await getPhotoBlob("keep", "thumb"))?.text()).toBe("kt");
+    expect(await getPhotoBlob("gone", "full")).toBeNull();
+    expect(await getPhotoBlob("gone", "thumb")).toBeNull();
   });
 });
 

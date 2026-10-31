@@ -9,12 +9,17 @@ closer to an ofrenda than a genealogy database: names plus memories.
 
 ## How to run
 
+Needs Node.js 20 or newer (Next.js 15 runs on 18.18, but the Vitest
+test suite needs 20+).
+
 ```bash
 npm install
 cp .env.example .env.local
 npm run dev
 # open http://localhost:3000
 ```
+
+For a production build, run `npm run build && npm start`.
 
 ### With Ollama (recommended — this is the open-AI core of the project)
 
@@ -59,7 +64,9 @@ Cloud requests are billed per token (one chat message is roughly
 says it does not log or train on cloud prompts. In production the
 `/api/chat` route only logs timings and counts, not message text or
 names. If the key is missing or wrong, the server log says so and the
-chat uses the fallback parser.
+chat uses the fallback parser. The header pill reads “Ollama Cloud”
+with a blue dot in this mode, so users can see their messages leave
+the server.
 
 ### Without Ollama
 
@@ -73,22 +80,47 @@ times out, `/api/chat` falls back to a deterministic heuristic parser
 - “He married my mom, Hoa” / “I am married to Y”
 - “My brother / sister / son / daughter / wife / husband is X”
 - “My parents are Minh and Hoa”
-- “Thuc's wife is Hang” / “My dad's brother is Tuan”
-- “They have 3 kids: Thanh Ha, Tra My and Anh Khoi”
+- “I have a brother, his name is Thuc” / “I have two sisters, Mai and Ha”
+- “Thuc's wife is Hang” / “My dad's brother is Tuan” / “My brother's wife is Thu”
+- “They have 3 kids: Thanh Ha, Tra My and Anh Khoi” / “We have two kids”
 - “My brother's full name is Tran Dang Thuc. He was born in 1990”
+- “Born on 5 March 1960” (a full date; ambiguous dates like 05/03/1960
+  keep only the year)
+- “He is 2 years younger than me” (works out the missing birth year)
+
+It asks instead of guessing when a phrase is ambiguous, e.g. which side
+of the family an uncle is on.
 
 If a large model (e.g. `gemma4:31b`) keeps timing out, raise
 `OLLAMA_TIMEOUT_MS` in `.env.local` (default 90000).
 
-The chat header shows which path was used for the last message
-(`ollama:gemma4:12b` vs `fallback`).
+The pill in the header says where messages go, so nobody types family
+names without knowing. On page load it asks `GET /api/chat`, which
+returns only the mode and model name (never the host), and shows the
+configured model. After each message it shows what actually handled it:
+
+| `OLLAMA_HOST` | Pill | Dot |
+|---|---|---|
+| `localhost`, `127.x`, `::1` | Local AI · gemma4:12b | green |
+| `ollama.com` | Ollama Cloud · gemma4:31b | blue |
+| anything else (e.g. a home server) | Self-hosted AI · gemma4:12b | green |
+| Ollama failed, fallback used | Built-in parser | grey |
+
+Hovering the pill explains where the message was sent. The dot stays
+grey until a message has actually gone through Ollama. In `npm run dev`, each
+chat reply also has a collapsible debug line with the source, Ollama
+host, timings, token counts, and why Ollama was skipped if it was. Set
+`CHAT_DEBUG=1` to show it in a production build too (raw model output
+is never included there).
 
 ### Checks
 
 ```bash
 npm run typecheck   # tsc --noEmit
 npm run lint        # ESLint (next/core-web-vitals + next/typescript)
+npm run lint:fix    # ESLint with --fix
 npm test            # Vitest, tests live next to the code as *.test.ts
+npm run test:watch  # Vitest in watch mode
 npm run coverage    # Vitest + V8 coverage; HTML report in coverage/
 npm run check       # typecheck + lint + test
 ```
@@ -105,8 +137,9 @@ npm run check       # typecheck + lint + test
    This is deliberate: it stops the model merging two people with the
    same name or inventing dates.
 4. **Tree** — `lib/tree.ts` derives parents, children, spouses, and
-   siblings from just two stored edge types (`PARENT_OF`,
-   `SPOUSE_OF`/`PARTNER_OF`), labels everyone relative to the speaker
+   siblings from a few stored edge types (`PARENT_OF`,
+   `SPOUSE_OF`/`PARTNER_OF`, and `SIBLING_OF` only when two siblings'
+   shared parents are unknown), labels everyone relative to the speaker
    ("Mother", "Sister-in-law"), and draws parent/child links as family
    bars. Cards can be dragged (positions are saved; "Tidy up" resets
    them). Dragging empty space or scrolling pans the canvas;
@@ -122,11 +155,13 @@ npm run check       # typecheck + lint + test
    several people, so a wedding photo shows up on everyone's page.
    "Play slideshow" in the family gallery shows the current list full
    screen with captions, year and tagged names; it advances every 5
-   seconds (Space pauses, arrows step, Escape exits). Uploads are resized (2000px long edge plus a 400px thumbnail) and
-   stored in IndexedDB; only captions, years, and tags go in
-   localStorage with the tree.
+   seconds (Space pauses, arrows step, Escape exits). Any photo can
+   also be used as a person's avatar. Uploads are resized (2000px long
+   edge plus a 400px thumbnail) and stored in IndexedDB; only
+   captions, years, and tags go in localStorage with the tree.
 
-Try it with:
+Try it with (on an empty tree, the "Try an example" chip above the
+message box fills this in):
 
 > I'm Lan. My dad is Minh, born 1960 in Hanoi. He married my mom, Hoa.
 
@@ -137,16 +172,18 @@ parents, linked as spouses.
 
 In: chat extraction, proposal review with tree preview and undo,
 draggable/pannable/zoomable tree, relationship labels, person details
-(including a preferred name, shown on the card as "Full Name (Short)"),
-bio/story editing, avatar upload (resized, stored as a data URL),
-photo galleries for the family and each person (IndexedDB), a family
-photo slideshow with captions, manual
+(including a preferred name, shown on the card as "Full Name (Short)",
+and a full birth date or just a year), bio/story editing, avatar upload
+(resized, stored as a data URL), photo galleries for the family and
+each person (IndexedDB), a family photo slideshow with captions, manual
 add/edit/delete, linking existing people as relatives from the side
 panel, localStorage persistence (tree, chat history, and card
 positions), JSON export/import of the tree (people, links, avatars,
 stories, and card positions) via the Export / Import buttons in the
-header, and a Reset button that clears the tree, layout, pending
-suggestions and chat (with a confirmation and Undo).
+header (importing over an existing tree asks first and can be undone),
+a Reset button that clears the tree, layout, pending suggestions and
+chat (with a confirmation and Undo), and Chat / Tree tabs on narrow
+screens.
 
 Out (for later): user accounts and sharing, a real database,
 React Flow, GEDCOM import/export, voice recording, AI avatar
@@ -156,7 +193,7 @@ generation, automatic duplicate merging, timeline view.
 
 - **Persistence:** replace the localStorage code in `app/page.tsx`
   with Prisma + Postgres (a `Person` table and a `Relationship`
-  table, as sketched in the data-model note). The `Person` /
+  table). The `Person` /
   `Relationship` types in `lib/types.ts` already match that shape.
   Photos would become a `Photo` table plus files in object storage
   (S3, R2) uploaded via presigned URLs, replacing `lib/photo-store.ts`.

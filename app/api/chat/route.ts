@@ -8,6 +8,11 @@ import type {
 } from "@/lib/types";
 import { extractFallback } from "@/lib/extract-fallback";
 import { birthLabel, isIsoDate, yearOf } from "@/lib/dates";
+import { modelLocation, type ModelConfig } from "@/lib/model-location";
+
+// OLLAMA_HOST comes from the server's runtime environment, so GET must
+// not be prerendered at build time.
+export const dynamic = "force-dynamic";
 
 const SYSTEM_PROMPT = `You extract family-tree facts from ONE chat message. You do NOT chat freely.
 
@@ -51,6 +56,7 @@ const SEND_DEBUG = LOG_CONTENT || process.env.CHAT_DEBUG === "1";
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "gemma4:12b";
+const OLLAMA_WHERE = modelLocation(OLLAMA_HOST);
 
 function log(...args: unknown[]) {
   console.log(`[chat ${new Date().toISOString().slice(11, 23)}]`, ...args);
@@ -389,6 +395,12 @@ async function tryOllama(
   }
 }
 
+// Lets the page show where messages will go before the first one is sent.
+export function GET() {
+  const config: ModelConfig = { where: OLLAMA_WHERE, model: OLLAMA_MODEL };
+  return NextResponse.json(config);
+}
+
 export async function POST(req: Request) {
   const requestStarted = Date.now();
   const debug: ExtractionDebug = {
@@ -398,7 +410,8 @@ export async function POST(req: Request) {
     totalMs: 0,
     kept: 0,
   };
-  const respond = (payload: { reply: string; proposals: Proposal[]; modelUsed: string }) => {
+  const respond = (reply: { reply: string; proposals: Proposal[]; modelUsed: string }) => {
+    const payload = { ...reply, where: OLLAMA_WHERE, model: OLLAMA_MODEL };
     if (!SEND_DEBUG) return NextResponse.json(payload);
     debug.kept = payload.proposals.length;
     debug.totalMs = Date.now() - requestStarted;

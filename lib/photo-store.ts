@@ -59,6 +59,21 @@ export async function deletePhotoBlobs(id: string): Promise<void> {
   });
 }
 
+// Reset clears photos but keeps their blobs so Undo can bring them back;
+// whatever is still unreferenced on the next load is removed here.
+export async function pruneOrphanPhotoBlobs(keepIds: Set<string>): Promise<void> {
+  await transact("readwrite", (store) => {
+    const req = store.openKeyCursor();
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const id = String(cursor.key).replace(/:(full|thumb)$/, "");
+      if (!keepIds.has(id)) store.delete(cursor.key);
+      cursor.continue();
+    };
+  });
+}
+
 export function isQuotaError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "QuotaExceededError";
 }

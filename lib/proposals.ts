@@ -9,12 +9,9 @@ export function uid(): string {
 }
 
 export function initials(name: string): string {
-  return name
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((w) => w[0]?.toUpperCase() ?? "")
-    .join("");
+  const words = name.split(/\s+/).filter(Boolean);
+  const picked = words.length > 1 ? [words[0], words[words.length - 1]] : words;
+  return picked.map((w) => w[0].toUpperCase()).join("");
 }
 
 // Models reuse ids like "p1" / "temp-minh" every turn, so cards left

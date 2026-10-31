@@ -50,8 +50,10 @@ describe("uid", () => {
 });
 
 describe("initials", () => {
-  it("takes the first letter of the first two words", () => {
-    expect(initials("tran hai dang")).toBe("TH");
+  it("takes the first letter of the first and last words", () => {
+    expect(initials("Harry James Potter")).toBe("HP");
+    expect(initials("tran hai dang")).toBe("TD");
+    expect(initials("Harry Potter")).toBe("HP");
     expect(initials("  Lan  ")).toBe("L");
     expect(initials("")).toBe("");
   });

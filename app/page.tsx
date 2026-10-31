@@ -1264,7 +1264,7 @@ export default function Home() {
     <div className="pt-app">
       <header className="pt-header">
         <div className="pt-brand">
-          <span aria-hidden>🌼</span>
+          <span aria-hidden>🌱</span>
           <h1>Family Tree</h1>
         </div>
         <span className="pt-pill" title="Extraction runs on your machine when Ollama is running; otherwise a rule-based parser.">
@@ -1397,11 +1397,14 @@ export default function Home() {
                 <h2>Your tree starts with you</h2>
                 <p>Tell the chat who you are and who your parents are. You&apos;ll review everything before it&apos;s added.</p>
                 <div className="pt-row">
-                  <button className="pt-btn pt-btn-primary" onClick={() => applySuggestion(EXAMPLE)}>
-                    Use the example
-                  </button>
-                  <button className="pt-btn pt-btn-secondary" onClick={() => setShowAdd(true)}>
-                    Add someone by hand
+                  <button
+                    className="pt-btn pt-btn-orange"
+                    onClick={() => {
+                      setMobileTab("chat");
+                      requestAnimationFrame(() => inputRef.current?.focus());
+                    }}
+                  >
+                    Get Started
                   </button>
                 </div>
               </div>

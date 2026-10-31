@@ -63,6 +63,8 @@ button { cursor: pointer; }
 .pt-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .pt-btn-primary { background: var(--marigold); color: #fff; }
 .pt-btn-primary:not(:disabled):hover { background: #c97b00; }
+.pt-btn-orange { background: #f97316; color: #fff; padding: 10px 22px; font-size: 15px; }
+.pt-btn-orange:not(:disabled):hover { background: #ea580c; }
 .pt-btn-secondary { background: #fff; border-color: var(--line); color: var(--ink); }
 .pt-btn-secondary:hover { border-color: var(--marigold); }
 .pt-btn-ghost { background: transparent; color: var(--muted); }
